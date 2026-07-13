@@ -3,6 +3,12 @@ GitHub Copilot Detailed Usage Report Generator
 
 Fetches Copilot usage data from the GitHub API and generates a summary report
 with overall metrics, cost center-wise usage, and model-wise usage.
+
+Updated for the June 2026 AI Credits billing model:
+  - Uses the new Copilot metrics reports API (NDJSON download-based)
+  - Supports per-user ai_credits_used tracking
+  - Fetches Copilot seat assignments for accurate user counts
+  - Uses included_ai_credits from the billing API for pooled credits
 """
 
 import os
@@ -59,6 +65,146 @@ def get_auth_headers(token):
         "Authorization": "Bearer " + token,
         "X-GitHub-Api-Version": "2022-11-28"
     }
+
+
+# ---------------------------------------------------------------------------
+# NEW: Copilot metrics reports API (NDJSON-based, replaces legacy metrics)
+# ---------------------------------------------------------------------------
+
+def fetch_copilot_metrics_report(enterprise, token, start_date, end_date):
+    """
+    Fetch enterprise Copilot metrics using the new reports API.
+
+    The new API (GA as of 2026) returns download links to NDJSON files
+    instead of inline JSON.  We iterate day-by-day and download each report.
+
+    Endpoint: GET /enterprises/{enterprise}/copilot/metrics/reports/enterprise-1-day
+              ?day=YYYY-MM-DD
+
+    Falls back to the legacy /copilot/metrics endpoint if the reports API
+    is unavailable.
+    """
+    headers = get_auth_headers(token)
+    all_data = []
+
+    current = start_date
+    while current <= end_date:
+        day_str = current.strftime("%Y-%m-%d")
+        url = (f"https://api.github.com/enterprises/{enterprise}"
+               f"/copilot/metrics/reports/enterprise-1-day")
+        params = {"day": day_str}
+
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            download_links = data.get("download_links", [])
+            if download_links:
+                ndjson_data = download_ndjson(download_links)
+                for record in ndjson_data:
+                    record.setdefault("date", day_str)
+                all_data.extend(ndjson_data)
+            elif isinstance(data, list):
+                # Some API versions may still return inline data
+                all_data.extend(data)
+        elif response.status_code == 404:
+            # Reports API not available — caller will fall back to legacy
+            print("Note: Copilot metrics reports API not available. "
+                  "Will try legacy metrics endpoint.")
+            return None
+        elif response.status_code in (204, 422):
+            pass  # No data for this day
+        else:
+            print(f"Warning: Metrics report API returned {response.status_code} "
+                  f"for {day_str}")
+
+        current += timedelta(days=1)
+
+    return all_data if all_data else None
+
+
+def fetch_copilot_user_metrics(enterprise, token, start_date, end_date):
+    """
+    Fetch per-user Copilot metrics using the new reports API.
+
+    Endpoint: GET /enterprises/{enterprise}/copilot/metrics/reports/users-1-day
+              ?day=YYYY-MM-DD
+
+    Each NDJSON line contains per-user data including ai_credits_used.
+    Returns a list of per-user records across all days in the range.
+    """
+    headers = get_auth_headers(token)
+    all_user_data = []
+
+    current = start_date
+    while current <= end_date:
+        day_str = current.strftime("%Y-%m-%d")
+        url = (f"https://api.github.com/enterprises/{enterprise}"
+               f"/copilot/metrics/reports/users-1-day")
+        params = {"day": day_str}
+
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            download_links = data.get("download_links", [])
+            if download_links:
+                ndjson_data = download_ndjson(download_links)
+                for record in ndjson_data:
+                    record.setdefault("date", day_str)
+                all_user_data.extend(ndjson_data)
+            elif isinstance(data, list):
+                all_user_data.extend(data)
+        elif response.status_code == 404:
+            print("Note: Per-user metrics reports API not available.")
+            return None
+        elif response.status_code in (204, 422):
+            pass  # No data for this day
+        else:
+            print(f"Warning: User metrics report API returned "
+                  f"{response.status_code} for {day_str}")
+
+        current += timedelta(days=1)
+
+    return all_user_data if all_user_data else None
+
+
+def fetch_copilot_seats(enterprise, token):
+    """
+    Fetch all Copilot seat assignments for the enterprise.
+
+    Endpoint: GET /enterprises/{enterprise}/copilot/billing/seats
+
+    Returns a list of seat objects containing user info, organization,
+    and assignment details.  Used for accurate user counts.
+    """
+    headers = get_auth_headers(token)
+    all_seats = []
+    page = 1
+
+    while True:
+        url = f"https://api.github.com/enterprises/{enterprise}/copilot/billing/seats"
+        params = {"page": page, "per_page": 100}
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            seats = data.get("seats", [])
+            if not seats:
+                break
+            all_seats.extend(seats)
+            if len(seats) < 100:
+                break
+            page += 1
+        elif response.status_code in (403, 404):
+            print(f"Note: Copilot seats API returned {response.status_code}. "
+                  f"Will estimate user count from other sources.")
+            return None
+        else:
+            print(f"Warning: Copilot seats API returned {response.status_code}")
+            return None
+
+    return all_seats
 
 
 def download_ndjson(download_links):
@@ -183,6 +329,11 @@ def fetch_copilot_usage(enterprise, token, start_date, end_date):
 def fetch_copilot_billing(enterprise, token):
     """
     Fetch Copilot billing/seats information to get license and pooled credits data.
+
+    As of June 2026, the response includes:
+      - included_ai_credits: total monthly AI credits pool
+      - ai_credits_used: total AI credits consumed this billing cycle
+      - seat_breakdown: seat assignment details
     """
     headers = get_auth_headers(token)
 
@@ -198,14 +349,39 @@ def fetch_copilot_billing(enterprise, token):
 
 def fetch_enterprise_billing_usage(enterprise, token, year, month):
     """
-    Fetch enterprise billing usage line items.
-    Endpoint: GET /enterprises/{enterprise}/settings/billing/usage
+    Fetch enterprise billing usage data.
 
-    Returns detailed line items for every billable product (including Copilot AI
-    credits).  Each item may carry a costCenter / organizationName field that lets
-    us build a cost-center-wise breakdown without a separate API call.
+    Tries two approaches:
+    1. New reports API: GET /enterprises/{enterprise}/settings/billing/reports
+       Returns download links to CSV/NDJSON files with detailed line items.
+    2. Legacy API: GET /enterprises/{enterprise}/settings/billing/usage
+       Returns JSON with usageItems array.
+
+    Returns the raw response data for processing.
     """
     headers = get_auth_headers(token)
+
+    # Try the new reports API first
+    reports_url = f"https://api.github.com/enterprises/{enterprise}/settings/billing/reports"
+    response = requests.get(reports_url, headers=headers, timeout=30)
+
+    if response.status_code == 200:
+        data = response.json()
+        exports = data.get("usage_report_exports", [])
+        # Find a completed report covering our target month
+        target_start = f"{year}-{month:02d}-01"
+        for export in exports:
+            if (export.get("status") == "completed" and
+                    export.get("start_date", "") <= target_start and
+                    export.get("end_date", "") >= target_start):
+                download_urls = export.get("download_urls", [])
+                if download_urls:
+                    report_data = download_ndjson(download_urls)
+                    if report_data:
+                        return {"usageItems": report_data, "source": "reports_api"}
+        # No matching report found; fall through to legacy API
+
+    # Try legacy billing usage API
     url = f"https://api.github.com/enterprises/{enterprise}/settings/billing/usage"
     params = {"year": year, "month": month}
 
@@ -379,9 +555,24 @@ def process_usage_data(usage_data):
     }
 
 
+def _extract_username(record):
+    """Extract a username from a user data record, handling multiple formats."""
+    username = record.get("login") or record.get("user_login") or ""
+    if not username:
+        user_field = record.get("user")
+        if isinstance(user_field, dict):
+            username = user_field.get("login", "")
+        elif user_field:
+            username = str(user_field)
+    return username or "Unknown"
+
+
 def process_user_report_data(user_data, user_teams_data):
     """
     Process user-level report data (NDJSON) to extract per-user and per-team breakdowns.
+
+    Supports both legacy format (copilot_ide_code_completions nested structure)
+    and new format (flat ai_credits_used field).
     """
     total_credits = 0
     unique_users = set()
@@ -389,7 +580,6 @@ def process_user_report_data(user_data, user_teams_data):
     model_credits = defaultdict(float)
 
     # Build user-to-team mapping from user-teams report
-    # The API may use 'team_slug' or 'team' depending on the report version
     user_team_map = {}
     for entry in user_teams_data:
         login = entry.get("login", "")
@@ -398,11 +588,19 @@ def process_user_report_data(user_data, user_teams_data):
             user_team_map[login] = team
 
     for record in user_data:
-        username = record.get("login", "Unknown")
+        username = _extract_username(record)
         unique_users.add(username)
         team = user_team_map.get(username, "Not Assigned")
 
-        # Aggregate credits from all Copilot features
+        # New format: flat ai_credits_used field (June 2026+)
+        ai_credits = record.get("ai_credits_used", 0) or 0
+        if ai_credits > 0:
+            total_credits += ai_credits
+            cost_center_credits[team]["credits"] += ai_credits
+            cost_center_credits[team]["users"].add(username)
+            continue
+
+        # Legacy format: nested feature data
         user_credits = 0
 
         for feature_key in ("copilot_ide_code_completions", "copilot_ide_chat",
@@ -519,6 +717,54 @@ def process_metrics_data(metrics_data):
         "unique_users": unique_users_max,
         "cost_center_breakdown": cost_center_credits,
         "model_breakdown": model_credits
+    }
+
+
+def process_per_user_metrics(user_metrics_data, seats_data=None):
+    """
+    Process per-user metrics from the new reports API (ai_credits_used).
+
+    Each record has:
+      user_login, ai_credits_used, and optionally organization, model info.
+
+    If seats_data is provided, it is used to map users to organizations
+    for cost-center attribution.
+    """
+    total_credits = 0
+    unique_users = set()
+    user_credits_map = defaultdict(float)
+    org_credits = defaultdict(lambda: {"credits": 0.0, "users": set()})
+
+    # Build user → org mapping from seats data
+    user_org_map = {}
+    if seats_data:
+        for seat in seats_data:
+            assignee = seat.get("assignee", {})
+            login = assignee.get("login", "") if isinstance(assignee, dict) else ""
+            org = (seat.get("organization", {}).get("login", "")
+                   if isinstance(seat.get("organization"), dict) else
+                   seat.get("organization", ""))
+            if login:
+                user_org_map[login] = org or "Not Assigned"
+
+    for record in user_metrics_data:
+        username = _extract_username(record)
+        credits = float(record.get("ai_credits_used", 0) or 0)
+        org = record.get("organization") or user_org_map.get(username, "Not Assigned")
+
+        unique_users.add(username)
+        user_credits_map[username] += credits
+        total_credits += credits
+        org_credits[org]["credits"] += credits
+        org_credits[org]["users"].add(username)
+
+    return {
+        "total_credits": total_credits,
+        "unique_users": len(unique_users),
+        "user_credits": dict(user_credits_map),
+        "org_breakdown": dict(org_credits),
+        "cost_center_breakdown": {},
+        "model_breakdown": {}
     }
 
 
@@ -707,10 +953,11 @@ def _get_user_count(cost_center_data):
 
 
 # Default AI-credits-per-seat used when the billing API does not return the value.
-# Copilot Business and Enterprise both include 100 AI credits / seat / month as of 2025.
+# As of June 2026, GitHub Copilot Enterprise includes 3,900 AI credits / seat / month.
+# A temporary promotional boost of 7,000 credits/seat runs from June 1 to Sept 1, 2026.
 # Verify against https://docs.github.com/en/billing/managing-billing-for-your-products/
 # managing-billing-for-github-copilot/about-billing-for-github-copilot when upgrading.
-_DEFAULT_AI_CREDITS_PER_SEAT = 100
+_DEFAULT_AI_CREDITS_PER_SEAT = 3900
 
 
 def generate_report(report_data, billing_data, month_name):
@@ -723,41 +970,46 @@ def generate_report(report_data, billing_data, month_name):
     model_breakdown = report_data["model_breakdown"]
 
     # Get pooled (allocated) credits from billing data.
-    # GitHub exposes this under several field names depending on the API version.
+    # As of June 2026, the billing API returns included_ai_credits directly.
     pooled_credits = "N/A"
     if billing_data:
-        # Support both top-level total_seats and nested seat_breakdown.total
-        seat_breakdown = billing_data.get("seat_breakdown", {})
-        seat_count = (billing_data.get("total_seats") or
-                      seat_breakdown.get("total") or 0)
-
-        # Try every known field name for the monthly AI-credit allocation
+        # Try the direct included_ai_credits field first (2026+ API)
         total_included = (
+            billing_data.get("included_ai_credits") or
             billing_data.get("total_included_ai_credits") or
             billing_data.get("included_credits") or
             billing_data.get("allocated_ai_credits") or
             billing_data.get("monthly_included_ai_credits") or
-            billing_data.get("ai_credits_budget") or
-            billing_data.get("included_ai_credits")
+            billing_data.get("ai_credits_budget")
         )
 
         if total_included:
             pooled_credits = int(total_included)
-        elif seat_count:
-            # GitHub Copilot seats include a monthly AI-credits allocation.
-            # Try the per-seat field; fall back to the module-level constant.
-            premium_per_seat = (
-                billing_data.get("premium_requests_per_seat") or
-                billing_data.get("included_requests_per_seat") or
-                billing_data.get("ai_credits_per_seat")
-            )
-            if premium_per_seat:
-                pooled_credits = int(seat_count * premium_per_seat)
+        else:
+            # Fall back to seat count × credits per seat
+            seat_breakdown = billing_data.get("seat_breakdown", {})
+            if isinstance(seat_breakdown, list):
+                # New format: seat_breakdown is a list of seat objects
+                seat_count = len(seat_breakdown)
+            elif isinstance(seat_breakdown, dict):
+                seat_count = (billing_data.get("total_seats") or
+                              seat_breakdown.get("total") or 0)
             else:
-                pooled_credits = int(seat_count * _DEFAULT_AI_CREDITS_PER_SEAT)
-                print(f"Note: 'premium_requests_per_seat' not in billing response. "
-                      f"Using default {_DEFAULT_AI_CREDITS_PER_SEAT} AI credits/seat. "
-                      f"Total seats: {seat_count}")
+                seat_count = billing_data.get("total_seats") or 0
+
+            if seat_count:
+                premium_per_seat = (
+                    billing_data.get("ai_credits_per_seat") or
+                    billing_data.get("premium_requests_per_seat") or
+                    billing_data.get("included_requests_per_seat")
+                )
+                if premium_per_seat:
+                    pooled_credits = int(seat_count * premium_per_seat)
+                else:
+                    pooled_credits = int(seat_count * _DEFAULT_AI_CREDITS_PER_SEAT)
+                    print(f"Note: AI credits per seat not in billing response. "
+                          f"Using default {_DEFAULT_AI_CREDITS_PER_SEAT} AI credits/seat. "
+                          f"Total seats: {seat_count}")
 
     report_lines = []
     report_lines.append(f"GitHub Copilot USAGE SUMMARY REPORT - {month_name.upper()}")
@@ -929,89 +1181,133 @@ def main():
     print(f"Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
     print()
 
-    # ── Primary data sources ──────────────────────────────────────────────────
-    # 1. Enterprise billing usage  → actual AI credits consumed + cost-center labels
-    print("Fetching enterprise billing usage (AI credits)...")
-    billing_usage = fetch_enterprise_billing_usage(enterprise, token, year, month)
+    # ── Step 1: Fetch all data sources ────────────────────────────────────────
 
-    # 2. Cost centers list  → maps cost-center IDs/names to their org resources
-    print("Fetching cost centers...")
-    cost_centers = fetch_cost_centers(enterprise, token)
-
-    # 3. Enterprise Copilot metrics  → daily aggregates (model breakdown, user counts)
-    print("Fetching enterprise Copilot metrics...")
-    org_report_data = fetch_copilot_org_report(enterprise, token, start_date, end_date)
-
-    # 4. Billing/seats data  → allocated (included) AI credits per month
+    # 1a. Billing/seats data → allocated (included) AI credits per month
     print("Fetching billing information...")
     billing_data = fetch_copilot_billing(enterprise, token)
 
-    # ── Process billing usage (best source for used credits + cost centers) ──
+    # 1b. Copilot seat assignments → accurate user count
+    print("Fetching Copilot seat assignments...")
+    seats_data = fetch_copilot_seats(enterprise, token)
+
+    # 1c. Per-user metrics (new API, June 2026+) → ai_credits_used per user
+    print("Fetching per-user Copilot metrics...")
+    user_metrics_data = fetch_copilot_user_metrics(
+        enterprise, token, start_date, end_date
+    )
+
+    # 1d. Enterprise-level metrics reports (new API) → model breakdown, totals
+    print("Fetching enterprise Copilot metrics reports...")
+    enterprise_metrics_data = fetch_copilot_metrics_report(
+        enterprise, token, start_date, end_date
+    )
+
+    # 1e. Legacy enterprise metrics (fallback if new API unavailable)
+    legacy_metrics_data = None
+    if enterprise_metrics_data is None:
+        print("Fetching enterprise Copilot metrics (legacy)...")
+        legacy_metrics_data = fetch_copilot_org_report(
+            enterprise, token, start_date, end_date
+        )
+
+    # 1f. Enterprise billing usage → actual credits consumed + cost-center labels
+    print("Fetching enterprise billing usage (AI credits)...")
+    billing_usage = fetch_enterprise_billing_usage(enterprise, token, year, month)
+
+    # 1g. Cost centers list → maps cost-center IDs/names to org resources
+    print("Fetching cost centers...")
+    cost_centers = fetch_cost_centers(enterprise, token)
+
+    print()
+
+    # ── Step 2: Process all data sources ──────────────────────────────────────
+
+    # Process per-user metrics (best source for per-user AI credits + user count)
+    per_user_processed = None
+    if user_metrics_data:
+        print("Processing per-user metrics data...")
+        per_user_processed = process_per_user_metrics(user_metrics_data, seats_data)
+        print(f"  Per-user metrics: {per_user_processed['total_credits']:,.2f} AI credits, "
+              f"{per_user_processed['unique_users']} users")
+
+    # Process enterprise metrics (model breakdown, aggregate credits)
+    metrics_processed = None
+    metrics_source = enterprise_metrics_data or legacy_metrics_data
+    if metrics_source:
+        print("Processing enterprise-level metrics data...")
+        metrics_processed = process_metrics_data(metrics_source)
+
+    # Process billing usage (cost-center labels, included/additional breakdown)
     billing_usage_processed = process_billing_usage_data(billing_usage, cost_centers)
 
-    # ── Process enterprise metrics (best source for model breakdown + users) ──
-    metrics_processed = None
-    if org_report_data:
-        print("Processing enterprise-level metrics data...")
-        metrics_processed = process_metrics_data(org_report_data)
+    # Get seat count for user count fallback
+    seat_user_count = 0
+    if seats_data:
+        seat_user_count = len(seats_data)
+        print(f"  Seat assignments: {seat_user_count} users")
 
-    # ── Assemble final report_data ────────────────────────────────────────────
+    # ── Step 3: Assemble final report_data ────────────────────────────────────
+    # Priority: per-user metrics > billing usage > enterprise metrics > legacy
+
+    # Start with the best available total credits and user count
+    total_credits = 0
+    unique_users = 0
+    model_breakdown = {}
+    cost_center_breakdown = {}
+
+    # Total credits: prefer per-user metrics (most accurate real-time)
+    if per_user_processed and per_user_processed["total_credits"] > 0:
+        total_credits = per_user_processed["total_credits"]
+        unique_users = per_user_processed["unique_users"]
+        print(f"  Using per-user metrics for total credits: {total_credits:,.2f}")
+
+    # Check billing data for ai_credits_used (direct from billing API)
+    if billing_data:
+        billing_used = billing_data.get("ai_credits_used", 0) or 0
+        if billing_used > total_credits:
+            total_credits = billing_used
+            print(f"  Using billing API ai_credits_used: {total_credits:,.2f}")
+
+    # Cross-check with billing usage processed
     if billing_usage_processed and billing_usage_processed["total_credits"] > 0:
-        # Billing usage API gave us real credit totals and cost-center data
-        report_data = billing_usage_processed
-        print(f"  Billing usage: {report_data['total_credits']:,.2f} AI credits used")
+        if billing_usage_processed["total_credits"] > total_credits:
+            total_credits = billing_usage_processed["total_credits"]
+            print(f"  Using billing usage total: {total_credits:,.2f}")
 
-        # Supplement with metrics data where billing usage lacks detail
-        if metrics_processed:
-            # Only use metrics model breakdown if billing doesn't have one
-            # (billing has included/additional detail; metrics doesn't)
-            if not report_data.get("model_breakdown") and metrics_processed["model_breakdown"]:
-                report_data["model_breakdown"] = metrics_processed["model_breakdown"]
-            if metrics_processed["unique_users"] > report_data["unique_users"]:
-                report_data["unique_users"] = metrics_processed["unique_users"]
-            # The metrics API reflects near-real-time usage that may not yet be
-            # reflected in the billing system (processing lag).  When the metrics
-            # total is higher, we use it as the more up-to-date figure.  Note:
-            # billing data is authoritative for invoicing; metrics is used here
-            # solely to avoid under-reporting during the billing lag window.
-            if metrics_processed["total_credits"] > report_data["total_credits"]:
-                print(f"Note: Metrics API total ({metrics_processed['total_credits']:,.2f}) "
-                      f"is higher than billing total ({report_data['total_credits']:,.2f}). "
-                      f"Using metrics total (may include usage not yet reflected in billing).")
-                report_data["total_credits"] = metrics_processed["total_credits"]
+    # Cross-check with metrics processed
+    if metrics_processed and metrics_processed["total_credits"] > total_credits:
+        total_credits = metrics_processed["total_credits"]
+        print(f"  Using metrics total: {total_credits:,.2f}")
 
-        # If billing usage had no cost-center labels on its items,
-        # build the breakdown from org-level metrics as a fallback
-        if not report_data["cost_center_breakdown"] and cost_centers:
-            print("Building cost-center breakdown from org metrics (billing items "
-                  "lacked cost-center labels)...")
-            cc_breakdown = build_cost_center_metrics(
-                cost_centers, token, start_date, end_date
-            )
-            if cc_breakdown:
-                report_data["cost_center_breakdown"] = cc_breakdown
+    # User count: prefer per-user metrics > seats > metrics estimate
+    if unique_users == 0 and seat_user_count > 0:
+        unique_users = seat_user_count
+    if unique_users == 0 and metrics_processed:
+        unique_users = metrics_processed["unique_users"]
 
-    elif metrics_processed and metrics_processed["total_credits"] > 0:
-        # Billing usage API unavailable – fall back to enterprise metrics
-        print("Billing usage API returned no data; using enterprise metrics.")
-        report_data = {
-            "total_credits": metrics_processed["total_credits"],
-            "unique_users": metrics_processed["unique_users"],
-            "model_breakdown": metrics_processed["model_breakdown"],
-            "cost_center_breakdown": {}
-        }
+    # Model breakdown: prefer billing usage (has included/additional) > metrics
+    if billing_usage_processed and billing_usage_processed.get("model_breakdown"):
+        model_breakdown = billing_usage_processed["model_breakdown"]
+    elif metrics_processed and metrics_processed.get("model_breakdown"):
+        model_breakdown = metrics_processed["model_breakdown"]
 
-        # Build cost-center breakdown from org-level metrics
-        if cost_centers:
-            print("Building cost-center breakdown from org metrics...")
-            cc_breakdown = build_cost_center_metrics(
-                cost_centers, token, start_date, end_date
-            )
-            if cc_breakdown:
-                report_data["cost_center_breakdown"] = cc_breakdown
+    # Cost center breakdown: prefer billing usage > per-user org > org metrics
+    if billing_usage_processed and billing_usage_processed.get("cost_center_breakdown"):
+        cost_center_breakdown = billing_usage_processed["cost_center_breakdown"]
+    elif per_user_processed and per_user_processed.get("org_breakdown"):
+        # Map org breakdown to cost center breakdown
+        cost_center_breakdown = per_user_processed["org_breakdown"]
+    elif cost_centers:
+        print("Building cost-center breakdown from org metrics...")
+        cc_breakdown = build_cost_center_metrics(
+            cost_centers, token, start_date, end_date
+        )
+        if cc_breakdown:
+            cost_center_breakdown = cc_breakdown
 
-    else:
-        # ── Legacy API fallback ───────────────────────────────────────────────
+    # ── Legacy fallback if all new sources returned nothing ────────────────
+    if total_credits == 0:
         print("Primary APIs returned no data. Trying legacy APIs...")
         print("Fetching Copilot usage data (legacy)...")
         usage_data = fetch_copilot_usage(enterprise, token, start_date, end_date)
@@ -1020,37 +1316,43 @@ def main():
         metrics_data = fetch_copilot_metrics(enterprise, token, start_date, end_date)
 
         if usage_data:
-            report_data = process_usage_data(usage_data)
-        else:
-            report_data = {
-                "total_credits": 0,
-                "unique_users": 0,
-                "cost_center_breakdown": {},
-                "model_breakdown": {}
-            }
+            legacy_result = process_usage_data(usage_data)
+            total_credits = legacy_result["total_credits"]
+            unique_users = max(unique_users, legacy_result["unique_users"])
+            if not model_breakdown:
+                model_breakdown = legacy_result["model_breakdown"]
+            if not cost_center_breakdown:
+                cost_center_breakdown = legacy_result["cost_center_breakdown"]
 
         if metrics_data:
             legacy_metrics = process_metrics_data(metrics_data)
-            if legacy_metrics["model_breakdown"]:
-                report_data["model_breakdown"] = legacy_metrics["model_breakdown"]
-            if legacy_metrics["total_credits"] > report_data["total_credits"]:
-                report_data["total_credits"] = legacy_metrics["total_credits"]
+            if legacy_metrics["model_breakdown"] and not model_breakdown:
+                model_breakdown = legacy_metrics["model_breakdown"]
+            if legacy_metrics["total_credits"] > total_credits:
+                total_credits = legacy_metrics["total_credits"]
 
         # Build cost-center breakdown from org metrics even in legacy path
-        if cost_centers and not report_data["cost_center_breakdown"]:
+        if cost_centers and not cost_center_breakdown:
             print("Building cost-center breakdown from org metrics (legacy path)...")
             cc_breakdown = build_cost_center_metrics(
                 cost_centers, token, start_date, end_date
             )
             if cc_breakdown:
-                report_data["cost_center_breakdown"] = cc_breakdown
+                cost_center_breakdown = cc_breakdown
 
-        if report_data["total_credits"] == 0:
-            print("\nWarning: No Copilot usage data could be retrieved from any API source.")
-            print("Please verify:")
-            print("  - ENTERPRISE_SLUG is correct")
-            print("  - GH_TOKEN has 'manage_billing:copilot' and 'read:enterprise' scopes")
-            print("  - The selected month has Copilot usage data")
+    if total_credits == 0:
+        print("\nWarning: No Copilot usage data could be retrieved from any API source.")
+        print("Please verify:")
+        print("  - ENTERPRISE_SLUG is correct")
+        print("  - GH_TOKEN has 'manage_billing:copilot' and 'read:enterprise' scopes")
+        print("  - The selected month has Copilot usage data")
+
+    report_data = {
+        "total_credits": total_credits,
+        "unique_users": unique_users,
+        "cost_center_breakdown": cost_center_breakdown,
+        "model_breakdown": model_breakdown
+    }
 
     # Generate the report
     report_text, csv_text = generate_report(report_data, billing_data, month_name)
