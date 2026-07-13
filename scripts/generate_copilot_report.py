@@ -57,18 +57,127 @@ def get_auth_headers(token):
     return {
         "Accept": "application/vnd.github+json",
         "Authorization": "Bearer " + token,
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2026-03-10"
     }
+
+
+def download_ndjson(download_links):
+    """Download and parse NDJSON files from signed URLs."""
+    all_data = []
+    for url in download_links:
+        # Signed URLs do not require authentication headers
+        response = requests.get(url, timeout=60)
+        if response.status_code == 200:
+            for line in response.text.strip().split('\n'):
+                if line.strip():
+                    try:
+                        all_data.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        print(f"Warning: Failed to parse NDJSON line: {line[:100]}")
+    return all_data
+
+
+def fetch_copilot_org_report(org, token, start_date, end_date):
+    """
+    Fetch organization-level Copilot usage metrics using the reports API.
+    Uses /orgs/{org}/copilot/metrics/reports/organization-1-day for each day.
+    """
+    headers = get_auth_headers(token)
+    all_data = []
+
+    current_date = start_date
+    while current_date <= end_date:
+        day_str = current_date.strftime("%Y-%m-%d")
+        url = f"https://api.github.com/orgs/{org}/copilot/metrics/reports/organization-1-day"
+        params = {"day": day_str}
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            download_links = data.get("download_links", [])
+            if download_links:
+                day_data = download_ndjson(download_links)
+                all_data.extend(day_data)
+        elif response.status_code == 204:
+            pass  # No data available for this day
+        elif response.status_code == 404:
+            print(f"Warning: Org metrics report not found for {day_str}.")
+            break
+        elif response.status_code == 403:
+            print("Warning: Access forbidden for org metrics report.")
+            print("Ensure the token has 'manage_billing:copilot' or 'read:org' scope.")
+            break
+        else:
+            print(f"Warning: Unexpected status {response.status_code} for org report on {day_str}.")
+
+        current_date += timedelta(days=1)
+
+    return all_data
+
+
+def fetch_copilot_user_report(org, token, start_date, end_date):
+    """
+    Fetch user-level Copilot usage metrics using the reports API.
+    Uses /orgs/{org}/copilot/metrics/reports/users-1-day for each day.
+    """
+    headers = get_auth_headers(token)
+    all_data = []
+
+    current_date = start_date
+    while current_date <= end_date:
+        day_str = current_date.strftime("%Y-%m-%d")
+        url = f"https://api.github.com/orgs/{org}/copilot/metrics/reports/users-1-day"
+        params = {"day": day_str}
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            download_links = data.get("download_links", [])
+            if download_links:
+                day_data = download_ndjson(download_links)
+                all_data.extend(day_data)
+        elif response.status_code == 204:
+            pass
+        elif response.status_code in (403, 404):
+            print(f"Warning: User metrics report not available ({response.status_code}). Skipping user-level data.")
+            break
+        else:
+            print(f"Warning: Unexpected status {response.status_code} for user report on {day_str}.")
+
+        current_date += timedelta(days=1)
+
+    return all_data
+
+
+def fetch_copilot_user_teams(org, token, end_date):
+    """
+    Fetch user-team mappings from the reports API.
+    Uses /orgs/{org}/copilot/metrics/reports/user-teams-1-day for the end date.
+    """
+    headers = get_auth_headers(token)
+    day_str = end_date.strftime("%Y-%m-%d")
+    url = f"https://api.github.com/orgs/{org}/copilot/metrics/reports/user-teams-1-day"
+    params = {"day": day_str}
+    response = requests.get(url, headers=headers, params=params, timeout=30)
+
+    if response.status_code == 200:
+        data = response.json()
+        download_links = data.get("download_links", [])
+        if download_links:
+            return download_ndjson(download_links)
+    elif response.status_code != 204:
+        print(f"Note: User-teams report not available ({response.status_code}). Team data will not be included.")
+
+    return []
 
 
 def fetch_copilot_usage(org, token, start_date, end_date):
     """
-    Fetch Copilot usage data from GitHub API.
-    Uses the /orgs/{org}/copilot/usage endpoint.
+    Fetch Copilot usage data from the legacy GitHub API.
+    Uses the /orgs/{org}/copilot/usage endpoint (deprecated, kept as fallback).
     """
     headers = get_auth_headers(token)
 
-    # Fetch usage data
     usage_url = f"https://api.github.com/orgs/{org}/copilot/usage"
     params = {
         "since": start_date.strftime("%Y-%m-%d"),
@@ -81,7 +190,7 @@ def fetch_copilot_usage(org, token, start_date, end_date):
     while True:
         params["page"] = page
         params["per_page"] = 100
-        response = requests.get(usage_url, headers=headers, params=params)
+        response = requests.get(usage_url, headers=headers, params=params, timeout=30)
 
         if response.status_code == 200:
             data = response.json()
@@ -92,15 +201,14 @@ def fetch_copilot_usage(org, token, start_date, end_date):
                 break
             page += 1
         elif response.status_code == 404:
-            print("Error: Organization not found or Copilot usage API not available.")
-            print("Ensure the organization has Copilot enabled and the token has appropriate permissions.")
-            sys.exit(1)
+            print("Note: Legacy usage API not available (deprecated). Using reports API data.")
+            return []
         elif response.status_code == 403:
-            print("Error: Access forbidden. Ensure the token has 'manage_billing:copilot' or 'org:read' scope.")
-            sys.exit(1)
+            print("Note: Legacy usage API access forbidden. Using reports API data.")
+            return []
         else:
-            print(f"Error fetching usage data: {response.status_code} - {response.text}")
-            sys.exit(1)
+            print(f"Note: Legacy usage API returned {response.status_code}. Using reports API data.")
+            return []
 
     return all_usage_data
 
@@ -112,7 +220,7 @@ def fetch_copilot_billing(org, token):
     headers = get_auth_headers(token)
 
     billing_url = f"https://api.github.com/orgs/{org}/copilot/billing"
-    response = requests.get(billing_url, headers=headers)
+    response = requests.get(billing_url, headers=headers, timeout=30)
 
     if response.status_code == 200:
         return response.json()
@@ -123,7 +231,7 @@ def fetch_copilot_billing(org, token):
 
 def fetch_copilot_metrics(org, token, start_date, end_date):
     """
-    Fetch Copilot metrics from the newer metrics API endpoint.
+    Fetch Copilot metrics from the legacy metrics API endpoint (deprecated, kept as fallback).
     """
     headers = get_auth_headers(token)
 
@@ -133,12 +241,12 @@ def fetch_copilot_metrics(org, token, start_date, end_date):
         "until": end_date.strftime("%Y-%m-%d")
     }
 
-    response = requests.get(metrics_url, headers=headers, params=params)
+    response = requests.get(metrics_url, headers=headers, params=params, timeout=30)
 
     if response.status_code == 200:
         return response.json()
     else:
-        print(f"Note: Metrics API returned {response.status_code}. Using usage API data instead.")
+        print(f"Note: Legacy metrics API returned {response.status_code}. Using reports API data.")
         return None
 
 
@@ -184,6 +292,72 @@ def process_usage_data(usage_data):
             if not model:
                 model = "Unknown"
             model_credits[model] += day_credits
+
+    return {
+        "total_credits": total_credits,
+        "unique_users": len(unique_users),
+        "cost_center_breakdown": cost_center_credits,
+        "model_breakdown": model_credits
+    }
+
+
+def process_user_report_data(user_data, user_teams_data):
+    """
+    Process user-level report data (NDJSON) to extract per-user and per-team breakdowns.
+    """
+    total_credits = 0
+    unique_users = set()
+    cost_center_credits = defaultdict(lambda: {"credits": 0, "users": set()})
+    model_credits = defaultdict(float)
+
+    # Build user-to-team mapping from user-teams report
+    # The API may use 'team_slug' or 'team' depending on the report version
+    user_team_map = {}
+    for entry in user_teams_data:
+        login = entry.get("login", "")
+        team = entry.get("team_slug") or entry.get("team", "")
+        if login and team:
+            user_team_map[login] = team
+
+    for record in user_data:
+        username = record.get("login", "Unknown")
+        unique_users.add(username)
+        team = user_team_map.get(username, "Not Assigned")
+
+        # Aggregate credits from all Copilot features
+        user_credits = 0
+
+        for feature_key in ("copilot_ide_code_completions", "copilot_ide_chat",
+                            "copilot_dotcom_chat", "copilot_dotcom_pull_requests"):
+            feature_data = record.get(feature_key, {})
+            if not feature_data:
+                continue
+
+            if feature_key == "copilot_ide_code_completions":
+                for editor_data in feature_data.get("editors", []):
+                    for model_data in editor_data.get("models", []):
+                        model_name = model_data.get("name", "Unknown")
+                        for lang in model_data.get("languages", []):
+                            credits = lang.get("total_credits_consumed", 0) or 0
+                            user_credits += credits
+                            model_credits[model_name] += credits
+            elif feature_key == "copilot_ide_chat":
+                for editor_data in feature_data.get("editors", []):
+                    for model_data in editor_data.get("models", []):
+                        model_name = model_data.get("name", "Unknown")
+                        credits = model_data.get("total_credits_consumed", 0) or 0
+                        user_credits += credits
+                        model_credits[model_name] += credits
+            else:
+                for model_data in feature_data.get("models", []):
+                    model_name = model_data.get("name", "Unknown")
+                    credits = model_data.get("total_credits_consumed", 0) or 0
+                    user_credits += credits
+                    model_credits[model_name] += credits
+
+        total_credits += user_credits
+        cost_center_credits[team]["credits"] += user_credits
+        cost_center_credits[team]["users"].add(username)
 
     return {
         "total_credits": total_credits,
@@ -389,34 +563,63 @@ def main():
     print(f"Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
     print()
 
-    # Fetch data from GitHub API
-    print("Fetching Copilot usage data...")
-    usage_data = fetch_copilot_usage(org, token, start_date, end_date)
+    # Fetch data from GitHub API (new reports API as primary source)
+    print("Fetching organization metrics report...")
+    org_report_data = fetch_copilot_org_report(org, token, start_date, end_date)
+
+    print("Fetching user metrics report...")
+    user_report_data = fetch_copilot_user_report(org, token, start_date, end_date)
+
+    print("Fetching user-teams mapping...")
+    user_teams_data = fetch_copilot_user_teams(org, token, end_date)
 
     print("Fetching billing information...")
     billing_data = fetch_copilot_billing(org, token)
 
-    print("Fetching metrics data...")
-    metrics_data = fetch_copilot_metrics(org, token, start_date, end_date)
-
-    # Process the data
-    if usage_data:
-        report_data = process_usage_data(usage_data)
-    else:
+    # Process the data - prefer user-level report for cost center breakdown
+    if user_report_data:
+        print("Processing user-level report data...")
+        report_data = process_user_report_data(user_report_data, user_teams_data)
+    elif org_report_data:
+        print("Processing organization-level report data...")
+        org_processed = process_metrics_data(org_report_data)
         report_data = {
-            "total_credits": 0,
+            "total_credits": org_processed["total_credits"],
             "unique_users": 0,
             "cost_center_breakdown": {},
-            "model_breakdown": {}
+            "model_breakdown": org_processed["model_breakdown"]
         }
+    else:
+        # Fall back to legacy APIs
+        print("Reports API data not available. Trying legacy APIs...")
+        print("Fetching Copilot usage data (legacy)...")
+        usage_data = fetch_copilot_usage(org, token, start_date, end_date)
 
-    # If metrics data is available, use it for model breakdown (more accurate)
-    if metrics_data:
-        metrics_processed = process_metrics_data(metrics_data)
-        if metrics_processed["model_breakdown"]:
-            report_data["model_breakdown"] = metrics_processed["model_breakdown"]
-        if metrics_processed["total_credits"] > 0:
-            report_data["total_credits"] = metrics_processed["total_credits"]
+        print("Fetching metrics data (legacy)...")
+        metrics_data = fetch_copilot_metrics(org, token, start_date, end_date)
+
+        if usage_data:
+            report_data = process_usage_data(usage_data)
+        else:
+            report_data = {
+                "total_credits": 0,
+                "unique_users": 0,
+                "cost_center_breakdown": {},
+                "model_breakdown": {}
+            }
+
+        if metrics_data:
+            metrics_processed = process_metrics_data(metrics_data)
+            if metrics_processed["model_breakdown"]:
+                report_data["model_breakdown"] = metrics_processed["model_breakdown"]
+            if metrics_processed["total_credits"] > 0:
+                report_data["total_credits"] = metrics_processed["total_credits"]
+
+    # If org report data is available and we used user data, cross-check totals
+    if org_report_data and user_report_data:
+        org_processed = process_metrics_data(org_report_data)
+        if org_processed["total_credits"] > report_data["total_credits"]:
+            report_data["total_credits"] = org_processed["total_credits"]
 
     # Generate the report
     report_text, csv_text = generate_report(report_data, billing_data, month_name, org)
