@@ -265,7 +265,7 @@ def download_ndjson(download_links):
     """Download and parse NDJSON files from signed URLs."""
     all_data = []
     for url in download_links:
-        if not url or not url.strip():
+        if not url.strip():
             print("Warning: Skipping empty download URL.")
             continue
         # Signed URLs do not require authentication headers
