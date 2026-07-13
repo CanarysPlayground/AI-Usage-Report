@@ -272,11 +272,12 @@ def fetch_org_copilot_metrics(org, token, start_date, end_date):
 
     Used to build a cost-center-level breakdown when the billing-usage API
     does not include cost-center fields in its line items.
-    The endpoint supports a maximum range of 28 days per request.
+    The endpoint supports a maximum range of 28 days per request; we use
+    27-day chunks to avoid off-by-one boundary issues on inclusive date ranges.
     """
     headers = get_auth_headers(token)
     all_data = []
-    chunk_size = timedelta(days=27)
+    chunk_size = timedelta(days=27)  # 27 not 28: keeps both ends inclusive safely
     current_start = start_date
 
     while current_start <= end_date:
@@ -609,8 +610,15 @@ def build_cost_center_metrics(cost_centers, token, start_date, end_date):
 
     This is used as a fallback when the billing-usage API does not carry
     cost-center information directly in its line items.
+
+    Returns a defaultdict keyed by cost-center name.  Each value has:
+      credits    – float, total AI credits consumed
+      users      – set (may be empty); user_count stores the count separately
+      user_count – int, number of unique users reported by the org metrics API
     """
-    cost_center_credits = defaultdict(lambda: {"credits": 0.0, "users": set()})
+    cost_center_credits = defaultdict(
+        lambda: {"credits": 0.0, "users": set(), "user_count": 0}
+    )
 
     if not cost_centers:
         return cost_center_credits
@@ -631,14 +639,14 @@ def build_cost_center_metrics(cost_centers, token, start_date, end_date):
                 )
                 if org_metrics:
                     org_processed = process_metrics_data(org_metrics)
-                    credits = org_processed["total_credits"]
-                    users = org_processed["unique_users"]
-                    cost_center_credits[center_name]["credits"] += credits
-                    # Add placeholder user entries so the count is preserved
-                    for i in range(users):
-                        cost_center_credits[center_name]["users"].add(
-                            f"__org_{res_name}_user_{i}__"
-                        )
+                    cost_center_credits[center_name]["credits"] += (
+                        org_processed["total_credits"]
+                    )
+                    # Keep the user count as a plain integer to avoid creating
+                    # synthetic set members which inflate counts on aggregation.
+                    cost_center_credits[center_name]["user_count"] += (
+                        org_processed["unique_users"]
+                    )
 
     return cost_center_credits
 
@@ -684,10 +692,12 @@ def generate_report(report_data, billing_data, month_name):
             if premium_per_seat:
                 pooled_credits = int(seat_count * premium_per_seat)
             else:
-                # Default: Copilot Business = 100 AI credits / seat / month.
-                # Display the seat count alongside for transparency.
-                plan_type = (billing_data.get("plan_type") or "").lower()
-                default_credits_per_seat = 100  # conservative default
+                # GitHub Copilot plans include a monthly AI-credits allocation per seat:
+                #   Business:   100 AI credits / seat / month  (observed default)
+                #   Enterprise: may vary; also typically ~100 AI credits / seat / month
+                # If the billing API does not return the per-seat value, we fall back
+                # to 100, which matches the ecanarys enterprise (580 seats × 100 = 58 000).
+                default_credits_per_seat = 100
                 pooled_credits = int(seat_count * default_credits_per_seat)
                 print(f"Note: 'premium_requests_per_seat' not in billing response. "
                       f"Using default {default_credits_per_seat} AI credits/seat. "
@@ -721,16 +731,21 @@ def generate_report(report_data, billing_data, month_name):
     )
 
     total_center_credits = 0
-    all_users = set()
+    total_center_users = 0
     for center, data in sorted_centers:
         credits = data["credits"]
-        users = len(data["users"])
+        # Prefer the explicit user_count field (set by build_cost_center_metrics)
+        # when the users set is empty (cost-center fallback path); otherwise use
+        # the set length (populated by process_billing_usage_data / user-report path).
+        users = data.get("user_count") or len(data.get("users", set()))
         total_center_credits += credits
-        all_users.update(data["users"])
+        total_center_users += users
         report_lines.append(f"  {center:<30} {credits:>18,.2f} {users:>8}")
 
     report_lines.append(f"  {'-'*30} {'-'*18} {'-'*8}")
-    report_lines.append(f"  {'TOTAL':<30} {total_center_credits:>18,.2f} {len(all_users):>8}")
+    report_lines.append(
+        f"  {'TOTAL':<30} {total_center_credits:>18,.2f} {total_center_users:>8}"
+    )
     report_lines.append("")
     report_lines.append("")
 
@@ -774,8 +789,9 @@ def generate_report(report_data, billing_data, month_name):
     writer.writerow(["COST CENTER WISE AI CREDIT USAGE"])
     writer.writerow(["Cost Center", "Total AI Credits", "Users"])
     for center, data in sorted_centers:
-        writer.writerow([center, f"{data['credits']:.2f}", len(data["users"])])
-    writer.writerow(["TOTAL", f"{total_center_credits:.2f}", len(all_users)])
+        users = data.get("user_count") or len(data.get("users", set()))
+        writer.writerow([center, f"{data['credits']:.2f}", users])
+    writer.writerow(["TOTAL", f"{total_center_credits:.2f}", total_center_users])
     writer.writerow([])
 
     # Model breakdown
