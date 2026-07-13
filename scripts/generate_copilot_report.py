@@ -66,14 +66,14 @@ def download_ndjson(download_links):
     all_data = []
     for url in download_links:
         # Signed URLs do not require authentication headers
-        response = requests.get(url)
+        response = requests.get(url, timeout=60)
         if response.status_code == 200:
             for line in response.text.strip().split('\n'):
                 if line.strip():
                     try:
                         all_data.append(json.loads(line))
                     except json.JSONDecodeError:
-                        continue
+                        print(f"Warning: Failed to parse NDJSON line: {line[:100]}")
     return all_data
 
 
@@ -90,7 +90,7 @@ def fetch_copilot_org_report(org, token, start_date, end_date):
         day_str = current_date.strftime("%Y-%m-%d")
         url = f"https://api.github.com/orgs/{org}/copilot/metrics/reports/organization-1-day"
         params = {"day": day_str}
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, timeout=30)
 
         if response.status_code == 200:
             data = response.json()
@@ -128,7 +128,7 @@ def fetch_copilot_user_report(org, token, start_date, end_date):
         day_str = current_date.strftime("%Y-%m-%d")
         url = f"https://api.github.com/orgs/{org}/copilot/metrics/reports/users-1-day"
         params = {"day": day_str}
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, timeout=30)
 
         if response.status_code == 200:
             data = response.json()
@@ -158,7 +158,7 @@ def fetch_copilot_user_teams(org, token, end_date):
     day_str = end_date.strftime("%Y-%m-%d")
     url = f"https://api.github.com/orgs/{org}/copilot/metrics/reports/user-teams-1-day"
     params = {"day": day_str}
-    response = requests.get(url, headers=headers, params=params)
+    response = requests.get(url, headers=headers, params=params, timeout=30)
 
     if response.status_code == 200:
         data = response.json()
@@ -190,7 +190,7 @@ def fetch_copilot_usage(org, token, start_date, end_date):
     while True:
         params["page"] = page
         params["per_page"] = 100
-        response = requests.get(usage_url, headers=headers, params=params)
+        response = requests.get(usage_url, headers=headers, params=params, timeout=30)
 
         if response.status_code == 200:
             data = response.json()
@@ -220,7 +220,7 @@ def fetch_copilot_billing(org, token):
     headers = get_auth_headers(token)
 
     billing_url = f"https://api.github.com/orgs/{org}/copilot/billing"
-    response = requests.get(billing_url, headers=headers)
+    response = requests.get(billing_url, headers=headers, timeout=30)
 
     if response.status_code == 200:
         return response.json()
@@ -241,7 +241,7 @@ def fetch_copilot_metrics(org, token, start_date, end_date):
         "until": end_date.strftime("%Y-%m-%d")
     }
 
-    response = requests.get(metrics_url, headers=headers, params=params)
+    response = requests.get(metrics_url, headers=headers, params=params, timeout=30)
 
     if response.status_code == 200:
         return response.json()
@@ -311,6 +311,7 @@ def process_user_report_data(user_data, user_teams_data):
     model_credits = defaultdict(float)
 
     # Build user-to-team mapping from user-teams report
+    # The API may use 'team_slug' or 'team' depending on the report version
     user_team_map = {}
     for entry in user_teams_data:
         login = entry.get("login", "")
