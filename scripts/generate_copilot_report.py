@@ -1012,6 +1012,23 @@ def _get_user_count(cost_center_data):
     return cost_center_data.get("user_count") or len(cost_center_data.get("users", set()))
 
 
+def _coerce_number(value):
+    """Convert API numeric values to float, tolerating numeric strings."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", "")
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # AI credits per assigned seat per month – values from GitHub official docs:
 # https://docs.github.com/en/copilot/concepts/billing/
@@ -1089,48 +1106,29 @@ def generate_report(report_data, billing_data, month_name,
     cost_center_breakdown = report_data["cost_center_breakdown"]
     model_breakdown = report_data["model_breakdown"]
 
-    # Build a sorted list of licensed usernames for the report.
-    # Prefer seat-holders (authoritative); fall back to users seen in metrics.
-    licensed_usernames = []
-    if seats_data:
-        for seat in seats_data:
-            assignee = seat.get("assignee", {})
-            login = assignee.get("login", "") if isinstance(assignee, dict) else ""
-            if login:
-                licensed_usernames.append(login)
-        licensed_usernames.sort(key=str.lower)
-    elif report_data.get("user_credits"):
-        licensed_usernames = sorted(report_data["user_credits"].keys(), key=str.lower)
-
     # Get pooled (allocated) credits from billing data.
     # As of June 2026, the billing API returns included_ai_credits directly.
-    # We try many field-name variations because the exact name varies across
-    # GitHub API versions and enterprise plan types.
+    # Only use included/allocated fields to avoid mixing in non-pool metrics.
     pooled_credits = "N/A"
     if billing_data:
-        # Try the direct included_ai_credits field first (2026+ API).
-        # Also check a nested "ai_credits" object that some API versions return.
         ai_credits_nested = billing_data.get("ai_credits") or {}
         if not isinstance(ai_credits_nested, dict):
             ai_credits_nested = {}
 
-        total_included = (
-            billing_data.get("included_ai_credits") or
-            billing_data.get("total_included_ai_credits") or
-            billing_data.get("included_credits") or
-            billing_data.get("allocated_ai_credits") or
-            billing_data.get("monthly_included_ai_credits") or
-            billing_data.get("ai_credits_budget") or
-            billing_data.get("copilot_included_ai_credits") or
-            billing_data.get("premium_requests_included") or
-            billing_data.get("total_premium_requests") or
-            ai_credits_nested.get("included") or
-            ai_credits_nested.get("total") or
-            ai_credits_nested.get("allocated")
+        included_candidates = (
+            billing_data.get("included_ai_credits"),
+            billing_data.get("total_included_ai_credits"),
+            billing_data.get("allocated_ai_credits"),
+            billing_data.get("monthly_included_ai_credits"),
+            billing_data.get("copilot_included_ai_credits"),
+            ai_credits_nested.get("included"),
+            ai_credits_nested.get("allocated"),
         )
-
-        if total_included:
-            pooled_credits = int(total_included)
+        for value in included_candidates:
+            parsed = _coerce_number(value)
+            if parsed is not None:
+                pooled_credits = int(parsed)
+                break
 
     # If the billing API didn't return a pool size, compute it from the seats
     # list using the per-plan-type credit rates from the GitHub docs.
@@ -1162,18 +1160,7 @@ def generate_report(report_data, billing_data, month_name,
     else:
         report_lines.append(f"  Pooled Credits (Allocated): {pooled_credits}")
     report_lines.append(f"  Total AI Credits Used:   {total_credits:,.2f}")
-    report_lines.append(f"  Total Copilot Licensed Users: {unique_users:,}")
-    report_lines.append("")
-    report_lines.append("")
-
-    # Licensed Users section
-    report_lines.append("COPILOT LICENSED USERS")
-    report_lines.append("-" * 40)
-    if licensed_usernames:
-        for uname in licensed_usernames:
-            report_lines.append(f"  {uname}")
-    else:
-        report_lines.append("  (No licensed user data available)")
+    report_lines.append(f"  Total Unique Active Users: {unique_users:,}")
     report_lines.append("")
     report_lines.append("")
 
@@ -1266,17 +1253,7 @@ def generate_report(report_data, billing_data, month_name,
     writer.writerow(["OVERALL METRICS"])
     writer.writerow(["Pooled Credits (Allocated)", pooled_credits])
     writer.writerow(["Total AI Credits Used", f"{total_credits:.2f}"])
-    writer.writerow(["Total Copilot Licensed Users", unique_users])
-    writer.writerow([])
-
-    # Licensed users list
-    writer.writerow(["COPILOT LICENSED USERS"])
-    writer.writerow(["Username"])
-    if licensed_usernames:
-        for uname in licensed_usernames:
-            writer.writerow([uname])
-    else:
-        writer.writerow(["(No licensed user data available)"])
+    writer.writerow(["Total Unique Active Users", unique_users])
     writer.writerow([])
 
     # Cost Center breakdown
@@ -1419,52 +1396,53 @@ def main():
     # ── Step 3: Assemble final report_data ────────────────────────────────────
     # Priority for total credits: billing API > billing usage line items >
     #   per-user metrics sum > enterprise metrics aggregate
-    # Priority for user count:    seats (licensed users) > metrics estimate
+    # Priority for user count:    per-user metrics > seats > metrics estimate
 
     total_credits = 0
     unique_users = 0
     model_breakdown = {}
     cost_center_breakdown = {}
 
-    # Total credits: start from per-user metrics sum
-    if per_user_processed and per_user_processed["total_credits"] > 0:
-        total_credits = per_user_processed["total_credits"]
-        print(f"  Using per-user metrics for total credits: {total_credits:,.2f}")
-
     # Check billing data for ai_credits_used (direct authoritative billing total).
-    # Try multiple field name variations used across GitHub API versions.
+    # Only use consumed/used fields to avoid mixing in unrelated billing metrics.
+    billing_used = None
     if billing_data:
         ai_credits_nested = billing_data.get("ai_credits") or {}
         if not isinstance(ai_credits_nested, dict):
             ai_credits_nested = {}
-        billing_used = (
-            billing_data.get("ai_credits_used") or
-            billing_data.get("ai_credits_used_this_billing_cycle") or
-            billing_data.get("ai_credits_used_this_cycle") or
-            billing_data.get("total_ai_credits_used") or
-            billing_data.get("credits_used") or
-            billing_data.get("copilot_ai_credits_used") or
-            ai_credits_nested.get("used") or
-            ai_credits_nested.get("consumed") or
-            0
-        ) or 0
-        if billing_used and billing_used > total_credits:
-            total_credits = billing_used
-            print(f"  Using billing API ai_credits_used: {total_credits:,.2f}")
+        used_candidates = (
+            billing_data.get("ai_credits_used"),
+            billing_data.get("ai_credits_used_this_billing_cycle"),
+            billing_data.get("ai_credits_used_this_cycle"),
+            billing_data.get("total_ai_credits_used"),
+            billing_data.get("copilot_ai_credits_used"),
+            ai_credits_nested.get("used"),
+            ai_credits_nested.get("consumed"),
+        )
+        for value in used_candidates:
+            parsed = _coerce_number(value)
+            if parsed is not None:
+                billing_used = parsed
+                break
 
-    # Cross-check with billing usage line items
-    if billing_usage_processed and billing_usage_processed["total_credits"] > 0:
-        if billing_usage_processed["total_credits"] > total_credits:
-            total_credits = billing_usage_processed["total_credits"]
-            print(f"  Using billing usage total: {total_credits:,.2f}")
-
-    # Cross-check with enterprise metrics aggregate
-    if metrics_processed and metrics_processed["total_credits"] > total_credits:
+    if billing_used is not None:
+        total_credits = billing_used
+        print(f"  Using billing API ai_credits_used: {total_credits:,.2f}")
+    elif billing_usage_processed and billing_usage_processed["total_credits"] > 0:
+        total_credits = billing_usage_processed["total_credits"]
+        print(f"  Using billing usage total: {total_credits:,.2f}")
+    elif per_user_processed and per_user_processed["total_credits"] > 0:
+        total_credits = per_user_processed["total_credits"]
+        print(f"  Using per-user metrics for total credits: {total_credits:,.2f}")
+    elif metrics_processed and metrics_processed["total_credits"] > 0:
         total_credits = metrics_processed["total_credits"]
         print(f"  Using metrics total: {total_credits:,.2f}")
 
-    # User count: seats = licensed users (authoritative) → metrics estimate fallback
-    if seat_user_count > 0:
+    # User count: prefer active unique users from per-user metrics; fallback to
+    # seat count (licensed users) then aggregate metrics estimate.
+    if per_user_processed and per_user_processed["unique_users"] > 0:
+        unique_users = per_user_processed["unique_users"]
+    elif seat_user_count > 0:
         unique_users = seat_user_count
     elif metrics_processed:
         unique_users = metrics_processed["unique_users"]
