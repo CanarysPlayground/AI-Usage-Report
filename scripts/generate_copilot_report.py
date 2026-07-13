@@ -343,7 +343,11 @@ def process_metrics_data(metrics_data):
     total_credits = 0
     cost_center_credits = defaultdict(lambda: {"credits": 0, "users": set()})
     model_credits = defaultdict(float)
-    unique_users_max = 0  # Maximum daily active users as monthly unique-user estimate
+    # The enterprise metrics API returns aggregate daily counts, not per-user records.
+    # We use the peak (maximum) daily active-user count as a conservative estimate of
+    # monthly unique users. This will undercount if different users are active on
+    # different days, but is the best approximation available from the aggregate API.
+    unique_users_max = 0
 
     for day_data in metrics_data:
         daily_users = day_data.get("total_active_users", 0) or 0
@@ -361,6 +365,10 @@ def process_metrics_data(metrics_data):
                 for model_data in editor_data.get("models", []):
                     model_name = model_data.get("name", "Unknown")
                     for lang in model_data.get("languages", []):
+                        # Prefer total_credits_consumed (newer API with AI credits billing).
+                        # Fall back to total_ai_tokens only if credits field is absent —
+                        # both represent consumption units from the same model response and
+                        # are used as proxies when the billing credit field is unavailable.
                         credits = (lang.get("total_credits_consumed") or
                                    lang.get("total_ai_tokens") or 0)
                         total_credits += credits
@@ -371,6 +379,7 @@ def process_metrics_data(metrics_data):
             for editor_data in copilot_ide_chat.get("editors", []):
                 for model_data in editor_data.get("models", []):
                     model_name = model_data.get("name", "Unknown")
+                    # Same preference: credits > tokens > 0
                     credits = (model_data.get("total_credits_consumed") or
                                model_data.get("total_ai_tokens") or 0)
                     total_credits += credits
