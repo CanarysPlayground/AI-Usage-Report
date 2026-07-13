@@ -22,6 +22,60 @@ from collections import defaultdict
 import requests
 
 
+def extract_download_links(api_data):
+    """
+    Extract NDJSON download links from API responses across formats.
+
+    Args:
+        api_data: API response body, which may be a dict, str, list, or other type.
+
+    Returns:
+        A list of signed download URL strings.
+    """
+    if isinstance(api_data, dict):
+        links = api_data.get("download_links", [])
+        if isinstance(links, str):
+            return [links]
+        if isinstance(links, list):
+            valid_links = [link for link in links if isinstance(link, str)]
+            if len(valid_links) != len(links):
+                print("Warning: Ignoring non-string values in download_links response.")
+            return valid_links
+        return []
+
+    # Some responses return a direct signed URL or a list of URLs
+    if isinstance(api_data, str):
+        return [api_data]
+    if isinstance(api_data, list):
+        if not api_data:
+            return []
+        valid_links = [item for item in api_data if isinstance(item, str)]
+        invalid_count = len(api_data) - len(valid_links)
+        if invalid_count:
+            print(f"Warning: Ignoring {invalid_count} non-string values in download link list response.")
+        return valid_links
+
+    return []
+
+
+def extract_inline_records(api_data):
+    """
+    Extract inline metric records when API returns a list of objects.
+
+    Args:
+        api_data: API response body, expected to sometimes be a list.
+
+    Returns:
+        A list of dictionary records.
+    """
+    if isinstance(api_data, list):
+        records = [item for item in api_data if isinstance(item, dict)]
+        if len(records) != len(api_data):
+            print("Warning: Ignoring non-object inline metric records.")
+        return records
+    return []
+
+
 def get_billing_month_dates(month_selection):
     """
     Calculate the start and end dates for the selected billing month.
@@ -98,7 +152,7 @@ def fetch_copilot_metrics_report(enterprise, token, start_date, end_date):
 
         if response.status_code == 200:
             data = response.json()
-            download_links = data.get("download_links", [])
+            download_links = extract_download_links(data)
             if download_links:
                 ndjson_data = download_ndjson(download_links)
                 for record in ndjson_data:
@@ -106,7 +160,7 @@ def fetch_copilot_metrics_report(enterprise, token, start_date, end_date):
                 all_data.extend(ndjson_data)
             elif isinstance(data, list):
                 # Some API versions may still return inline data
-                all_data.extend(data)
+                all_data.extend(extract_inline_records(data))
         elif response.status_code == 404:
             # Reports API not available — caller will fall back to legacy
             print("Note: Copilot metrics reports API not available. "
@@ -147,14 +201,14 @@ def fetch_copilot_user_metrics(enterprise, token, start_date, end_date):
 
         if response.status_code == 200:
             data = response.json()
-            download_links = data.get("download_links", [])
+            download_links = extract_download_links(data)
             if download_links:
                 ndjson_data = download_ndjson(download_links)
                 for record in ndjson_data:
                     record.setdefault("date", day_str)
                 all_user_data.extend(ndjson_data)
             elif isinstance(data, list):
-                all_user_data.extend(data)
+                all_user_data.extend(extract_inline_records(data))
         elif response.status_code == 404:
             print("Note: Per-user metrics reports API not available.")
             return None
@@ -1395,4 +1449,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
