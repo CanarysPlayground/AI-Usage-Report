@@ -52,16 +52,21 @@ def get_billing_month_dates(month_selection):
     return start_date, end_date
 
 
+def get_auth_headers(token):
+    """Build authentication headers for GitHub API requests."""
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": "Bearer " + token,
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
+
 def fetch_copilot_usage(org, token, start_date, end_date):
     """
     Fetch Copilot usage data from GitHub API.
     Uses the /orgs/{org}/copilot/usage endpoint.
     """
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"******",
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
+    headers = get_auth_headers(token)
 
     # Fetch usage data
     usage_url = f"https://api.github.com/orgs/{org}/copilot/usage"
@@ -104,11 +109,7 @@ def fetch_copilot_billing(org, token):
     """
     Fetch Copilot billing/seats information to get license and pooled credits data.
     """
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"******",
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
+    headers = get_auth_headers(token)
 
     billing_url = f"https://api.github.com/orgs/{org}/copilot/billing"
     response = requests.get(billing_url, headers=headers)
@@ -124,11 +125,7 @@ def fetch_copilot_metrics(org, token, start_date, end_date):
     """
     Fetch Copilot metrics from the newer metrics API endpoint.
     """
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"******",
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
+    headers = get_auth_headers(token)
 
     metrics_url = f"https://api.github.com/orgs/{org}/copilot/metrics"
     params = {
@@ -300,16 +297,16 @@ def generate_report(report_data, billing_data, month_name, org):
     )
 
     total_center_credits = 0
-    total_center_users = 0
+    all_users = set()
     for center, data in sorted_centers:
         credits = data["credits"]
         users = len(data["users"])
         total_center_credits += credits
-        total_center_users += users
+        all_users.update(data["users"])
         report_lines.append(f"  {center:<30} {credits:>18,.2f} {users:>8}")
 
     report_lines.append(f"  {'-'*30} {'-'*18} {'-'*8}")
-    report_lines.append(f"  {'TOTAL':<30} {total_center_credits:>18,.2f} {total_center_users:>8}")
+    report_lines.append(f"  {'TOTAL':<30} {total_center_credits:>18,.2f} {len(all_users):>8}")
     report_lines.append("")
     report_lines.append("")
 
@@ -354,7 +351,7 @@ def generate_report(report_data, billing_data, month_name, org):
     writer.writerow(["Cost Center", "Total AI Credits", "Users"])
     for center, data in sorted_centers:
         writer.writerow([center, f"{data['credits']:.2f}", len(data["users"])])
-    writer.writerow(["TOTAL", f"{total_center_credits:.2f}", total_center_users])
+    writer.writerow(["TOTAL", f"{total_center_credits:.2f}", len(all_users)])
     writer.writerow([])
 
     # Model breakdown
