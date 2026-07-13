@@ -808,8 +808,8 @@ def generate_report(report_data, billing_data, month_name):
     # Model wise breakdown
     report_lines.append("MODEL WISE AI CREDIT USAGE")
     report_lines.append("-" * 90)
-    report_lines.append(f"  {'Model Name':<30} {'Included':>15} {'Additional':>15} {'Gross Amount':>15}")
-    report_lines.append(f"  {'-'*30} {'-'*15} {'-'*15} {'-'*15}")
+    report_lines.append(f"  {'Model Name':<30} {'Included':>15} {'Additional':>15}")
+    report_lines.append(f"  {'-'*30} {'-'*15} {'-'*15}")
 
     sorted_models = []
     for model_name, model_data in model_breakdown.items():
@@ -837,19 +837,19 @@ def generate_report(report_data, billing_data, month_name):
             additional = model_data.get("additional", 0.0)
             total_included += included
             total_additional += additional
-            report_lines.append(f"  {model_name:<30} {included:>15,.2f} {additional:>15,.2f} {total:>15,.2f}")
+            report_lines.append(f"  {model_name:<30} {included:>15,.2f} {additional:>15,.2f}")
         else:
             # Old format - just total
-            report_lines.append(f"  {model_name:<30} {'-':>15} {'-':>15} {total:>15,.2f}")
+            report_lines.append(f"  {model_name:<30} {'-':>15} {'-':>15}")
 
-    report_lines.append(f"  {'-'*30} {'-'*15} {'-'*15} {'-'*15}")
+    report_lines.append(f"  {'-'*30} {'-'*15} {'-'*15}")
     # Use has_detailed_format computed earlier
     if has_detailed_format:
         report_lines.append(
-            f"  {'TOTAL':<30} {total_included:>15,.2f} {total_additional:>15,.2f} {total_model_credits:>15,.2f}"
+            f"  {'TOTAL':<30} {total_included:>15,.2f} {total_additional:>15,.2f}"
         )
     else:
-        report_lines.append(f"  {'TOTAL':<30} {'-':>15} {'-':>15} {total_model_credits:>15,.2f}")
+        report_lines.append(f"  {'TOTAL':<30} {'-':>15} {'-':>15}")
     report_lines.append("")
 
     report_text = "\n".join(report_lines)
@@ -883,13 +883,13 @@ def generate_report(report_data, billing_data, month_name):
     # - Else: write detailed header for consistency with text report
     if has_detailed_format and sorted_models:
         # New format with included/additional breakdown
-        writer.writerow(["Model Name", "Included Credits", "Additional Credits", "Gross Amount"])
+        writer.writerow(["Model Name", "Included Credits", "Additional Credits"])
         for model_name, model_data, total in sorted_models:
             if isinstance(model_data, dict):
                 included = model_data.get("included", 0.0)
                 additional = model_data.get("additional", 0.0)
-                writer.writerow([model_name, f"{included:.2f}", f"{additional:.2f}", f"{total:.2f}"])
-        writer.writerow(["TOTAL", f"{total_included:.2f}", f"{total_additional:.2f}", f"{total_model_credits:.2f}"])
+                writer.writerow([model_name, f"{included:.2f}", f"{additional:.2f}"])
+        writer.writerow(["TOTAL", f"{total_included:.2f}", f"{total_additional:.2f}"])
     elif sorted_models:
         # Old format - just total (from metrics API, no included/additional breakdown)
         writer.writerow(["Model Name", "Total AI Credits"])
@@ -898,7 +898,7 @@ def generate_report(report_data, billing_data, month_name):
         writer.writerow(["TOTAL", f"{total_model_credits:.2f}"])
     else:
         # No models available - write header only
-        writer.writerow(["Model Name", "Included Credits", "Additional Credits", "Gross Amount"])
+        writer.writerow(["Model Name", "Included Credits", "Additional Credits"])
 
     csv_text = csv_output.getvalue()
 
