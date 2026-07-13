@@ -554,6 +554,11 @@ def process_billing_usage_data(billing_usage, cost_centers):
 
     total_credits = 0.0
     cost_center_credits = defaultdict(lambda: {"credits": 0.0, "users": set()})
+    model_breakdown = defaultdict(lambda: {
+        "total": 0.0,
+        "included": 0.0,
+        "additional": 0.0
+    })
     found_copilot_items = False
 
     for item in usage_items:
@@ -596,18 +601,41 @@ def process_billing_usage_data(billing_usage, cost_centers):
         if not cc_name:
             cc_name = "Not Assigned"
 
+        # Determine if this is included or additional credit
+        # "add-on" or "addon" in SKU = additional credits
+        is_additional = any(kw in sku for kw in ("add-on", "addon"))
+
+        # Extract model name if available (from line_description or other fields)
+        model_name = (
+            item.get("modelName") or
+            item.get("model_name") or
+            item.get("model") or
+            "Unknown Model"
+        )
+
         total_credits += quantity
         cost_center_credits[cc_name]["credits"] += quantity
+        
+        # Track model breakdown with included/additional distinction
+        model_data = model_breakdown[model_name]
+        model_data["total"] += quantity
+        if is_additional:
+            model_data["additional"] += quantity
+        else:
+            model_data["included"] += quantity
 
     if not found_copilot_items or total_credits == 0:
         return None
 
-    return {
+    # Convert defaultdicts to regular dicts for cleaner return
+    result = {
         "total_credits": total_credits,
         "unique_users": 0,
-        "cost_center_breakdown": cost_center_credits,
-        "model_breakdown": {}
+        "cost_center_breakdown": dict(cost_center_credits),
+        "model_breakdown": dict(model_breakdown)
     }
+    
+    return result
 
 
 def build_cost_center_metrics(cost_centers, token, start_date, end_date):
@@ -769,23 +797,47 @@ def generate_report(report_data, billing_data, month_name):
 
     # Model wise breakdown
     report_lines.append("MODEL WISE AI CREDIT USAGE")
-    report_lines.append("-" * 60)
-    report_lines.append(f"  {'Model Name':<40} {'Total AI Credits':>18}")
-    report_lines.append(f"  {'-'*40} {'-'*18}")
+    report_lines.append("-" * 90)
+    report_lines.append(f"  {'Model Name':<30} {'Included':>15} {'Additional':>15} {'Gross Amount':>15}")
+    report_lines.append(f"  {'-'*30} {'-'*15} {'-'*15} {'-'*15}")
 
-    sorted_models = sorted(
-        model_breakdown.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
+    sorted_models = []
+    for model_name, model_data in model_breakdown.items():
+        if isinstance(model_data, dict):
+            # New format with included/additional breakdown
+            total = model_data.get("total", 0.0)
+        else:
+            # Old format - just a float total
+            total = model_data
+        sorted_models.append((model_name, model_data, total))
+    
+    sorted_models.sort(key=lambda x: x[2], reverse=True)
 
     total_model_credits = 0
-    for model, credits in sorted_models:
-        total_model_credits += credits
-        report_lines.append(f"  {model:<40} {credits:>18,.2f}")
+    total_included = 0.0
+    total_additional = 0.0
+    
+    for model_name, model_data, total in sorted_models:
+        total_model_credits += total
+        
+        if isinstance(model_data, dict):
+            # New format with included/additional breakdown
+            included = model_data.get("included", 0.0)
+            additional = model_data.get("additional", 0.0)
+            total_included += included
+            total_additional += additional
+            report_lines.append(f"  {model_name:<30} {included:>15,.2f} {additional:>15,.2f} {total:>15,.2f}")
+        else:
+            # Old format - just total
+            report_lines.append(f"  {model_name:<30} {'-':>15} {'-':>15} {total:>15,.2f}")
 
-    report_lines.append(f"  {'-'*40} {'-'*18}")
-    report_lines.append(f"  {'TOTAL':<40} {total_model_credits:>18,.2f}")
+    report_lines.append(f"  {'-'*30} {'-'*15} {'-'*15} {'-'*15}")
+    if isinstance(list(model_breakdown.values())[0] if model_breakdown else None, dict):
+        report_lines.append(
+            f"  {'TOTAL':<30} {total_included:>15,.2f} {total_additional:>15,.2f} {total_model_credits:>15,.2f}"
+        )
+    else:
+        report_lines.append(f"  {'TOTAL':<30} {'-':>15} {'-':>15} {total_model_credits:>15,.2f}")
     report_lines.append("")
 
     report_text = "\n".join(report_lines)
@@ -813,10 +865,21 @@ def generate_report(report_data, billing_data, month_name):
 
     # Model breakdown
     writer.writerow(["MODEL WISE AI CREDIT USAGE"])
-    writer.writerow(["Model Name", "Total AI Credits"])
-    for model, credits in sorted_models:
-        writer.writerow([model, f"{credits:.2f}"])
-    writer.writerow(["TOTAL", f"{total_model_credits:.2f}"])
+    if sorted_models and isinstance(sorted_models[0][1], dict):
+        # New format with included/additional breakdown
+        writer.writerow(["Model Name", "Included Credits", "Additional Credits", "Gross Amount"])
+        for model_name, model_data, total in sorted_models:
+            if isinstance(model_data, dict):
+                included = model_data.get("included", 0.0)
+                additional = model_data.get("additional", 0.0)
+                writer.writerow([model_name, f"{included:.2f}", f"{additional:.2f}", f"{total:.2f}"])
+        writer.writerow(["TOTAL", f"{total_included:.2f}", f"{total_additional:.2f}", f"{total_model_credits:.2f}"])
+    else:
+        # Old format - just total
+        writer.writerow(["Model Name", "Total AI Credits"])
+        for model_name, model_data, total in sorted_models:
+            writer.writerow([model_name, f"{total:.2f}"])
+        writer.writerow(["TOTAL", f"{total_model_credits:.2f}"])
 
     csv_text = csv_output.getvalue()
 
@@ -881,7 +944,9 @@ def main():
 
         # Supplement with metrics data where billing usage lacks detail
         if metrics_processed:
-            if metrics_processed["model_breakdown"]:
+            # Only use metrics model breakdown if billing doesn't have one
+            # (billing has included/additional detail; metrics doesn't)
+            if not report_data.get("model_breakdown") and metrics_processed["model_breakdown"]:
                 report_data["model_breakdown"] = metrics_processed["model_breakdown"]
             if metrics_processed["unique_users"] > report_data["unique_users"]:
                 report_data["unique_users"] = metrics_processed["unique_users"]
