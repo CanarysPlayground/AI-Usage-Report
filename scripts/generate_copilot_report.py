@@ -22,6 +22,27 @@ from collections import defaultdict
 import requests
 
 
+def extract_download_links(api_data):
+    """
+    Extract NDJSON download links from API responses across formats.
+    """
+    if isinstance(api_data, dict):
+        links = api_data.get("download_links", [])
+        if isinstance(links, str):
+            return [links]
+        if isinstance(links, list):
+            return [link for link in links if isinstance(link, str)]
+        return []
+
+    # Some responses return a direct signed URL or a list of URLs
+    if isinstance(api_data, str):
+        return [api_data]
+    if isinstance(api_data, list) and all(isinstance(item, str) for item in api_data):
+        return api_data
+
+    return []
+
+
 def get_billing_month_dates(month_selection):
     """
     Calculate the start and end dates for the selected billing month.
@@ -98,7 +119,7 @@ def fetch_copilot_metrics_report(enterprise, token, start_date, end_date):
 
         if response.status_code == 200:
             data = response.json()
-            download_links = data.get("download_links", [])
+            download_links = extract_download_links(data)
             if download_links:
                 ndjson_data = download_ndjson(download_links)
                 for record in ndjson_data:
@@ -106,7 +127,7 @@ def fetch_copilot_metrics_report(enterprise, token, start_date, end_date):
                 all_data.extend(ndjson_data)
             elif isinstance(data, list):
                 # Some API versions may still return inline data
-                all_data.extend(data)
+                all_data.extend([item for item in data if isinstance(item, dict)])
         elif response.status_code == 404:
             # Reports API not available — caller will fall back to legacy
             print("Note: Copilot metrics reports API not available. "
@@ -147,14 +168,14 @@ def fetch_copilot_user_metrics(enterprise, token, start_date, end_date):
 
         if response.status_code == 200:
             data = response.json()
-            download_links = data.get("download_links", [])
+            download_links = extract_download_links(data)
             if download_links:
                 ndjson_data = download_ndjson(download_links)
                 for record in ndjson_data:
                     record.setdefault("date", day_str)
                 all_user_data.extend(ndjson_data)
             elif isinstance(data, list):
-                all_user_data.extend(data)
+                all_user_data.extend([item for item in data if isinstance(item, dict)])
         elif response.status_code == 404:
             print("Note: Per-user metrics reports API not available.")
             return None
@@ -1395,4 +1416,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
