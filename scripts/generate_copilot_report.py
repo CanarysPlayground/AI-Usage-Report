@@ -1079,7 +1079,7 @@ def _enrich_cost_center_users(cost_center_breakdown, per_user_org_breakdown, per
                 org_users = set(org_users_value)
             else:
                 org_users = set()
-            if isinstance(org_users, set) and org_users:
+            if org_users:
                 users.update(org_users)
                 matched_any_center = True
 
@@ -1088,9 +1088,10 @@ def _enrich_cost_center_users(cost_center_breakdown, per_user_org_breakdown, per
             entry["user_count"] = len(users)
         enriched[center] = entry
 
+    only_center_name = next(iter(enriched), None) if len(enriched) == 1 else None
     should_use_not_assigned_fallback = (
-        not matched_any_center and "Not Assigned" in enriched and
-        len(enriched) == 1 and per_user_unique_users > 0
+        not matched_any_center and only_center_name == "Not Assigned" and
+        per_user_unique_users > 0
     )
     if should_use_not_assigned_fallback:
         enriched["Not Assigned"]["user_count"] = per_user_unique_users
