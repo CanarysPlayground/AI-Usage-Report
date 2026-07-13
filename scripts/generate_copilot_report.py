@@ -77,10 +77,10 @@ def download_ndjson(download_links):
     return all_data
 
 
-def fetch_copilot_org_report(org, token, start_date, end_date):
+def fetch_copilot_org_report(enterprise, token, start_date, end_date):
     """
-    Fetch organization-level Copilot usage metrics using the reports API.
-    Uses /orgs/{org}/copilot/metrics/reports/organization-1-day for each day.
+    Fetch enterprise-level Copilot usage metrics using the reports API.
+    Uses /enterprises/{enterprise}/copilot/metrics/reports/organization-1-day for each day.
     """
     headers = get_auth_headers(token)
     all_data = []
@@ -88,7 +88,7 @@ def fetch_copilot_org_report(org, token, start_date, end_date):
     current_date = start_date
     while current_date <= end_date:
         day_str = current_date.strftime("%Y-%m-%d")
-        url = f"https://api.github.com/orgs/{org}/copilot/metrics/reports/organization-1-day"
+        url = f"https://api.github.com/enterprises/{enterprise}/copilot/metrics/reports/organization-1-day"
         params = {"day": day_str}
         response = requests.get(url, headers=headers, params=params, timeout=30)
 
@@ -101,24 +101,24 @@ def fetch_copilot_org_report(org, token, start_date, end_date):
         elif response.status_code == 204:
             pass  # No data available for this day
         elif response.status_code == 404:
-            print(f"Warning: Org metrics report not found for {day_str}.")
+            print(f"Warning: Enterprise metrics report not found for {day_str}.")
             break
         elif response.status_code == 403:
-            print("Warning: Access forbidden for org metrics report.")
-            print("Ensure the token has 'manage_billing:copilot' or 'read:org' scope.")
+            print("Warning: Access forbidden for enterprise metrics report.")
+            print("Ensure the token has 'manage_billing:copilot' scope.")
             break
         else:
-            print(f"Warning: Unexpected status {response.status_code} for org report on {day_str}.")
+            print(f"Warning: Unexpected status {response.status_code} for enterprise report on {day_str}.")
 
         current_date += timedelta(days=1)
 
     return all_data
 
 
-def fetch_copilot_user_report(org, token, start_date, end_date):
+def fetch_copilot_user_report(enterprise, token, start_date, end_date):
     """
     Fetch user-level Copilot usage metrics using the reports API.
-    Uses /orgs/{org}/copilot/metrics/reports/users-1-day for each day.
+    Uses /enterprises/{enterprise}/copilot/metrics/reports/users-1-day for each day.
     """
     headers = get_auth_headers(token)
     all_data = []
@@ -126,7 +126,7 @@ def fetch_copilot_user_report(org, token, start_date, end_date):
     current_date = start_date
     while current_date <= end_date:
         day_str = current_date.strftime("%Y-%m-%d")
-        url = f"https://api.github.com/orgs/{org}/copilot/metrics/reports/users-1-day"
+        url = f"https://api.github.com/enterprises/{enterprise}/copilot/metrics/reports/users-1-day"
         params = {"day": day_str}
         response = requests.get(url, headers=headers, params=params, timeout=30)
 
@@ -149,14 +149,14 @@ def fetch_copilot_user_report(org, token, start_date, end_date):
     return all_data
 
 
-def fetch_copilot_user_teams(org, token, end_date):
+def fetch_copilot_user_teams(enterprise, token, end_date):
     """
     Fetch user-team mappings from the reports API.
-    Uses /orgs/{org}/copilot/metrics/reports/user-teams-1-day for the end date.
+    Uses /enterprises/{enterprise}/copilot/metrics/reports/user-teams-1-day for the end date.
     """
     headers = get_auth_headers(token)
     day_str = end_date.strftime("%Y-%m-%d")
-    url = f"https://api.github.com/orgs/{org}/copilot/metrics/reports/user-teams-1-day"
+    url = f"https://api.github.com/enterprises/{enterprise}/copilot/metrics/reports/user-teams-1-day"
     params = {"day": day_str}
     response = requests.get(url, headers=headers, params=params, timeout=30)
 
@@ -171,14 +171,14 @@ def fetch_copilot_user_teams(org, token, end_date):
     return []
 
 
-def fetch_copilot_usage(org, token, start_date, end_date):
+def fetch_copilot_usage(enterprise, token, start_date, end_date):
     """
     Fetch Copilot usage data from the legacy GitHub API.
-    Uses the /orgs/{org}/copilot/usage endpoint (deprecated, kept as fallback).
+    Uses the /enterprises/{enterprise}/copilot/usage endpoint (deprecated, kept as fallback).
     """
     headers = get_auth_headers(token)
 
-    usage_url = f"https://api.github.com/orgs/{org}/copilot/usage"
+    usage_url = f"https://api.github.com/enterprises/{enterprise}/copilot/usage"
     params = {
         "since": start_date.strftime("%Y-%m-%d"),
         "until": end_date.strftime("%Y-%m-%d")
@@ -213,13 +213,13 @@ def fetch_copilot_usage(org, token, start_date, end_date):
     return all_usage_data
 
 
-def fetch_copilot_billing(org, token):
+def fetch_copilot_billing(enterprise, token):
     """
     Fetch Copilot billing/seats information to get license and pooled credits data.
     """
     headers = get_auth_headers(token)
 
-    billing_url = f"https://api.github.com/orgs/{org}/copilot/billing"
+    billing_url = f"https://api.github.com/enterprises/{enterprise}/copilot/billing"
     response = requests.get(billing_url, headers=headers, timeout=30)
 
     if response.status_code == 200:
@@ -229,13 +229,13 @@ def fetch_copilot_billing(org, token):
         return None
 
 
-def fetch_copilot_metrics(org, token, start_date, end_date):
+def fetch_copilot_metrics(enterprise, token, start_date, end_date):
     """
     Fetch Copilot metrics from the legacy metrics API endpoint (deprecated, kept as fallback).
     """
     headers = get_auth_headers(token)
 
-    metrics_url = f"https://api.github.com/orgs/{org}/copilot/metrics"
+    metrics_url = f"https://api.github.com/enterprises/{enterprise}/copilot/metrics"
     params = {
         "since": start_date.strftime("%Y-%m-%d"),
         "until": end_date.strftime("%Y-%m-%d")
@@ -426,7 +426,7 @@ def process_metrics_data(metrics_data):
     }
 
 
-def generate_report(report_data, billing_data, month_name, org):
+def generate_report(report_data, billing_data, month_name):
     """
     Generate the usage report as a formatted string and CSV.
     """
@@ -449,7 +449,6 @@ def generate_report(report_data, billing_data, month_name, org):
     report_lines.append("")
     report_lines.append("OVERALL METRICS")
     report_lines.append("-" * 40)
-    report_lines.append(f"  Organization:            {org}")
     report_lines.append(f"  Total AI Credits Used:   {total_credits:,.2f}")
     report_lines.append(f"  Total Unique Users:      {unique_users:,}")
     if pooled_credits != "N/A":
@@ -543,12 +542,12 @@ def generate_report(report_data, billing_data, month_name, org):
 
 def main():
     # Configuration from environment variables
-    org = os.environ.get("GITHUB_ORG")
+    enterprise = os.environ.get("ENTERPRISE_SLUG")
     token = os.environ.get("GH_TOKEN")
     month_selection = os.environ.get("MONTH_SELECTION", "last_month")
 
-    if not org:
-        print("Error: GITHUB_ORG environment variable is required.")
+    if not enterprise:
+        print("Error: ENTERPRISE_SLUG environment variable is required.")
         sys.exit(1)
 
     if not token:
@@ -564,24 +563,24 @@ def main():
     print()
 
     # Fetch data from GitHub API (new reports API as primary source)
-    print("Fetching organization metrics report...")
-    org_report_data = fetch_copilot_org_report(org, token, start_date, end_date)
+    print("Fetching enterprise metrics report...")
+    org_report_data = fetch_copilot_org_report(enterprise, token, start_date, end_date)
 
     print("Fetching user metrics report...")
-    user_report_data = fetch_copilot_user_report(org, token, start_date, end_date)
+    user_report_data = fetch_copilot_user_report(enterprise, token, start_date, end_date)
 
     print("Fetching user-teams mapping...")
-    user_teams_data = fetch_copilot_user_teams(org, token, end_date)
+    user_teams_data = fetch_copilot_user_teams(enterprise, token, end_date)
 
     print("Fetching billing information...")
-    billing_data = fetch_copilot_billing(org, token)
+    billing_data = fetch_copilot_billing(enterprise, token)
 
     # Process the data - prefer user-level report for cost center breakdown
     if user_report_data:
         print("Processing user-level report data...")
         report_data = process_user_report_data(user_report_data, user_teams_data)
     elif org_report_data:
-        print("Processing organization-level report data...")
+        print("Processing enterprise-level report data...")
         org_processed = process_metrics_data(org_report_data)
         report_data = {
             "total_credits": org_processed["total_credits"],
@@ -593,10 +592,10 @@ def main():
         # Fall back to legacy APIs
         print("Reports API data not available. Trying legacy APIs...")
         print("Fetching Copilot usage data (legacy)...")
-        usage_data = fetch_copilot_usage(org, token, start_date, end_date)
+        usage_data = fetch_copilot_usage(enterprise, token, start_date, end_date)
 
         print("Fetching metrics data (legacy)...")
-        metrics_data = fetch_copilot_metrics(org, token, start_date, end_date)
+        metrics_data = fetch_copilot_metrics(enterprise, token, start_date, end_date)
 
         if usage_data:
             report_data = process_usage_data(usage_data)
@@ -615,14 +614,14 @@ def main():
             if metrics_processed["total_credits"] > 0:
                 report_data["total_credits"] = metrics_processed["total_credits"]
 
-    # If org report data is available and we used user data, cross-check totals
+    # If enterprise report data is available and we used user data, cross-check totals
     if org_report_data and user_report_data:
         org_processed = process_metrics_data(org_report_data)
         if org_processed["total_credits"] > report_data["total_credits"]:
             report_data["total_credits"] = org_processed["total_credits"]
 
     # Generate the report
-    report_text, csv_text = generate_report(report_data, billing_data, month_name, org)
+    report_text, csv_text = generate_report(report_data, billing_data, month_name)
 
     # Print report to console
     print("\n" + "=" * 60)
