@@ -94,10 +94,13 @@ def fetch_copilot_org_report(enterprise, token, start_date, end_date):
 
         if response.status_code == 200:
             data = response.json()
-            download_links = data.get("download_links", [])
-            if download_links:
-                day_data = download_ndjson(download_links)
-                all_data.extend(day_data)
+            if not isinstance(data, dict):
+                print(f"Warning: Unexpected response format for enterprise report on {day_str}. Skipping.")
+            else:
+                download_links = data.get("download_links", [])
+                if download_links:
+                    day_data = download_ndjson(download_links)
+                    all_data.extend(day_data)
         elif response.status_code == 204:
             pass  # No data available for this day
         elif response.status_code == 404:
@@ -132,10 +135,13 @@ def fetch_copilot_user_report(enterprise, token, start_date, end_date):
 
         if response.status_code == 200:
             data = response.json()
-            download_links = data.get("download_links", [])
-            if download_links:
-                day_data = download_ndjson(download_links)
-                all_data.extend(day_data)
+            if not isinstance(data, dict):
+                print(f"Warning: Unexpected response format for user report on {day_str}. Skipping.")
+            else:
+                download_links = data.get("download_links", [])
+                if download_links:
+                    day_data = download_ndjson(download_links)
+                    all_data.extend(day_data)
         elif response.status_code == 204:
             pass
         elif response.status_code in (403, 404):
@@ -162,9 +168,12 @@ def fetch_copilot_user_teams(enterprise, token, end_date):
 
     if response.status_code == 200:
         data = response.json()
-        download_links = data.get("download_links", [])
-        if download_links:
-            return download_ndjson(download_links)
+        if not isinstance(data, dict):
+            print(f"Warning: Unexpected response format for user-teams report on {day_str}. Skipping.")
+        else:
+            download_links = data.get("download_links", [])
+            if download_links:
+                return download_ndjson(download_links)
     elif response.status_code != 204:
         print(f"Note: User-teams report not available ({response.status_code}). Team data will not be included.")
 
