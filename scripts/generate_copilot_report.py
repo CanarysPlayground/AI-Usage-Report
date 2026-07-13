@@ -1160,7 +1160,7 @@ def generate_report(report_data, billing_data, month_name,
     else:
         report_lines.append(f"  Pooled Credits (Allocated): {pooled_credits}")
     report_lines.append(f"  Total AI Credits Used:   {total_credits:,.2f}")
-    report_lines.append(f"  Total Unique Users:      {unique_users:,}")
+    report_lines.append(f"  Total Unique Active Users: {unique_users:,}")
     report_lines.append("")
     report_lines.append("")
 
@@ -1253,7 +1253,7 @@ def generate_report(report_data, billing_data, month_name,
     writer.writerow(["OVERALL METRICS"])
     writer.writerow(["Pooled Credits (Allocated)", pooled_credits])
     writer.writerow(["Total AI Credits Used", f"{total_credits:.2f}"])
-    writer.writerow(["Total Unique Users", unique_users])
+    writer.writerow(["Total Unique Active Users", unique_users])
     writer.writerow([])
 
     # Cost Center breakdown
