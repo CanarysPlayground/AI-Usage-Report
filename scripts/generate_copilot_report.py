@@ -1029,6 +1029,80 @@ def _coerce_number(value):
     return None
 
 
+def _has_named_models(model_breakdown):
+    """Return True when a model breakdown contains at least one named model."""
+    if not model_breakdown:
+        return False
+
+    for model_name in model_breakdown.keys():
+        normalized = str(model_name or "").strip().lower()
+        if normalized not in ("", "unknown", "unknown model"):
+            return True
+
+    return False
+
+
+def _enrich_cost_center_users(cost_center_breakdown, per_user_org_breakdown, per_user_unique_users):
+    """
+    Add user counts to billing-derived cost-center rows using per-user org data.
+
+    Billing usage line items provide accurate credit totals but usually do not
+    include per-user attribution, which leaves Users = 0 in cost-center rows.
+    This helper overlays users from per-user metrics where cost-center names
+    match, and falls back to the overall active-user count for a single
+    "Not Assigned" row when no direct mapping is available.
+    """
+    if not cost_center_breakdown:
+        return cost_center_breakdown
+    if not per_user_org_breakdown:
+        return cost_center_breakdown
+
+    enriched = {}
+    matched_any_center = False
+
+    for center, data in cost_center_breakdown.items():
+        entry = dict(data)
+        users_value = entry.get("users")
+        if isinstance(users_value, set):
+            users = set(users_value)
+        elif isinstance(users_value, (list, tuple)):
+            users = set(users_value)
+        else:
+            users = set()
+
+        org_entry = per_user_org_breakdown.get(center)
+        if isinstance(org_entry, dict):
+            org_users_value = org_entry.get("users")
+            if isinstance(org_users_value, set):
+                org_users = set(org_users_value)
+            elif isinstance(org_users_value, (list, tuple)):
+                org_users = set(org_users_value)
+            else:
+                org_users = set()
+            if org_users:
+                users.update(org_users)
+                matched_any_center = True
+
+        entry["users"] = users
+        if users:
+            entry["user_count"] = len(users)
+        enriched[center] = entry
+
+    single_center_name = None
+    if len(enriched) == 1:
+        single_center_name = next(iter(enriched))
+
+    no_matches_found = not matched_any_center
+    is_single_not_assigned = single_center_name == "Not Assigned"
+    has_active_users = per_user_unique_users > 0
+
+    if (no_matches_found and is_single_not_assigned and has_active_users and
+            "Not Assigned" in enriched):
+        enriched["Not Assigned"]["user_count"] = per_user_unique_users
+
+    return enriched
+
+
 # ---------------------------------------------------------------------------
 # AI credits per assigned seat per month – values from GitHub official docs:
 # https://docs.github.com/en/copilot/concepts/billing/
@@ -1447,15 +1521,29 @@ def main():
     elif metrics_processed:
         unique_users = metrics_processed["unique_users"]
 
-    # Model breakdown: prefer billing usage (has included/additional) > metrics
+    # Model breakdown: prefer billing usage only when model names are present;
+    # otherwise use metrics (which usually carries detailed model names).
     if billing_usage_processed and billing_usage_processed.get("model_breakdown"):
-        model_breakdown = billing_usage_processed["model_breakdown"]
+        billing_models = billing_usage_processed["model_breakdown"]
+        metrics_models = (metrics_processed.get("model_breakdown")
+                          if metrics_processed else None)
+        if _has_named_models(billing_models) or not metrics_models:
+            model_breakdown = billing_models
+        else:
+            model_breakdown = metrics_models
+            print("  Billing usage model data lacked model names; using metrics model breakdown.")
     elif metrics_processed and metrics_processed.get("model_breakdown"):
         model_breakdown = metrics_processed["model_breakdown"]
 
     # Cost center breakdown: prefer billing usage > per-user org > org metrics
     if billing_usage_processed and billing_usage_processed.get("cost_center_breakdown"):
         cost_center_breakdown = billing_usage_processed["cost_center_breakdown"]
+        if per_user_processed and per_user_processed.get("org_breakdown"):
+            cost_center_breakdown = _enrich_cost_center_users(
+                cost_center_breakdown,
+                per_user_processed["org_breakdown"],
+                per_user_processed.get("unique_users", 0)
+            )
     elif per_user_processed and per_user_processed.get("org_breakdown"):
         # Map org breakdown to cost center breakdown
         cost_center_breakdown = per_user_processed["org_breakdown"]
