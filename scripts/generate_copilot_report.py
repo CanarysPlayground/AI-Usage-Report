@@ -170,8 +170,9 @@ def process_usage_data(usage_data):
             suggestions_count = breakdown.get("suggestions_count", 0) or 0
             acceptances_count = breakdown.get("acceptances_count", 0) or 0
 
-            # Use credits if available, otherwise estimate from activity
-            day_credits = credits if credits else suggestions_count * 0.01
+            # Use credits if available, otherwise fall back to suggestion count
+            # (estimation only used for legacy API responses without credit data)
+            day_credits = credits if credits else 0
 
             total_credits += day_credits
             unique_users.add(username)
