@@ -25,6 +25,12 @@ import requests
 def extract_download_links(api_data):
     """
     Extract NDJSON download links from API responses across formats.
+
+    Args:
+        api_data: API response body, which may be a dict, str, list, or other type.
+
+    Returns:
+        A list of signed download URL strings.
     """
     if isinstance(api_data, dict):
         links = api_data.get("download_links", [])
@@ -40,6 +46,13 @@ def extract_download_links(api_data):
     if isinstance(api_data, list) and all(isinstance(item, str) for item in api_data):
         return api_data
 
+    return []
+
+
+def extract_inline_records(api_data):
+    """Extract inline metric records when API returns a list of objects."""
+    if isinstance(api_data, list):
+        return [item for item in api_data if isinstance(item, dict)]
     return []
 
 
@@ -127,7 +140,7 @@ def fetch_copilot_metrics_report(enterprise, token, start_date, end_date):
                 all_data.extend(ndjson_data)
             elif isinstance(data, list):
                 # Some API versions may still return inline data
-                all_data.extend([item for item in data if isinstance(item, dict)])
+                all_data.extend(extract_inline_records(data))
         elif response.status_code == 404:
             # Reports API not available — caller will fall back to legacy
             print("Note: Copilot metrics reports API not available. "
@@ -175,7 +188,7 @@ def fetch_copilot_user_metrics(enterprise, token, start_date, end_date):
                     record.setdefault("date", day_str)
                 all_user_data.extend(ndjson_data)
             elif isinstance(data, list):
-                all_user_data.extend([item for item in data if isinstance(item, dict)])
+                all_user_data.extend(extract_inline_records(data))
         elif response.status_code == 404:
             print("Note: Per-user metrics reports API not available.")
             return None
