@@ -57,7 +57,7 @@ def get_auth_headers(token):
     return {
         "Accept": "application/vnd.github+json",
         "Authorization": "Bearer " + token,
-        "X-GitHub-Api-Version": "2026-03-10"
+        "X-GitHub-Api-Version": "2022-11-28"
     }
 
 
@@ -79,104 +79,62 @@ def download_ndjson(download_links):
 
 def fetch_copilot_org_report(enterprise, token, start_date, end_date):
     """
-    Fetch enterprise-level Copilot usage metrics using the reports API.
-    Uses /enterprises/{enterprise}/copilot/metrics/reports/organization-1-day for each day.
+    Fetch enterprise-level Copilot usage metrics using the real metrics API.
+    Uses /enterprises/{enterprise}/copilot/metrics with since/until parameters.
+    The endpoint supports a maximum range of 28 days per request.
     """
     headers = get_auth_headers(token)
     all_data = []
 
-    current_date = start_date
-    while current_date <= end_date:
-        day_str = current_date.strftime("%Y-%m-%d")
-        url = f"https://api.github.com/enterprises/{enterprise}/copilot/metrics/reports/organization-1-day"
-        params = {"day": day_str}
+    # Chunk requests to respect the 28-day API limit
+    chunk_size = timedelta(days=27)
+    current_start = start_date
+
+    while current_start <= end_date:
+        chunk_end = min(current_start + chunk_size, end_date)
+        url = f"https://api.github.com/enterprises/{enterprise}/copilot/metrics"
+        params = {
+            "since": current_start.strftime("%Y-%m-%d"),
+            "until": chunk_end.strftime("%Y-%m-%d")
+        }
         response = requests.get(url, headers=headers, params=params, timeout=30)
 
         if response.status_code == 200:
             data = response.json()
-            if not isinstance(data, dict):
-                print(f"Warning: Unexpected response format for enterprise report on {day_str}. Skipping.")
+            if isinstance(data, list):
+                all_data.extend(data)
             else:
-                download_links = data.get("download_links", [])
-                if download_links:
-                    day_data = download_ndjson(download_links)
-                    all_data.extend(day_data)
+                print(f"Warning: Unexpected response format for enterprise metrics. Skipping.")
         elif response.status_code == 204:
-            pass  # No data available for this day
+            pass  # No data available for this period
         elif response.status_code == 404:
-            print(f"Warning: Enterprise metrics report not found for {day_str}.")
+            print(f"Warning: Enterprise Copilot metrics not found. Check ENTERPRISE_SLUG.")
             break
         elif response.status_code == 403:
-            print("Warning: Access forbidden for enterprise metrics report.")
+            print("Warning: Access forbidden for enterprise metrics.")
             print("Ensure the token has 'manage_billing:copilot' scope.")
             break
         else:
-            print(f"Warning: Unexpected status {response.status_code} for enterprise report on {day_str}.")
+            print(f"Warning: Unexpected status {response.status_code} for enterprise metrics.")
 
-        current_date += timedelta(days=1)
+        current_start = chunk_end + timedelta(days=1)
 
     return all_data
 
 
 def fetch_copilot_user_report(enterprise, token, start_date, end_date):
     """
-    Fetch user-level Copilot usage metrics using the reports API.
-    Uses /enterprises/{enterprise}/copilot/metrics/reports/users-1-day for each day.
+    Per-user Copilot metrics are not available via the standard public API.
+    Enterprise-level metrics from fetch_copilot_org_report are used instead.
     """
-    headers = get_auth_headers(token)
-    all_data = []
-
-    current_date = start_date
-    while current_date <= end_date:
-        day_str = current_date.strftime("%Y-%m-%d")
-        url = f"https://api.github.com/enterprises/{enterprise}/copilot/metrics/reports/users-1-day"
-        params = {"day": day_str}
-        response = requests.get(url, headers=headers, params=params, timeout=30)
-
-        if response.status_code == 200:
-            data = response.json()
-            if not isinstance(data, dict):
-                print(f"Warning: Unexpected response format for user report on {day_str}. Skipping.")
-            else:
-                download_links = data.get("download_links", [])
-                if download_links:
-                    day_data = download_ndjson(download_links)
-                    all_data.extend(day_data)
-        elif response.status_code == 204:
-            pass
-        elif response.status_code in (403, 404):
-            print(f"Warning: User metrics report not available ({response.status_code}). Skipping user-level data.")
-            break
-        else:
-            print(f"Warning: Unexpected status {response.status_code} for user report on {day_str}.")
-
-        current_date += timedelta(days=1)
-
-    return all_data
+    return []
 
 
 def fetch_copilot_user_teams(enterprise, token, end_date):
     """
-    Fetch user-team mappings from the reports API.
-    Uses /enterprises/{enterprise}/copilot/metrics/reports/user-teams-1-day for the end date.
+    User-to-team mapping is not available via the standard public API.
+    Returns empty list; cost-center breakdown relies on team data when available.
     """
-    headers = get_auth_headers(token)
-    day_str = end_date.strftime("%Y-%m-%d")
-    url = f"https://api.github.com/enterprises/{enterprise}/copilot/metrics/reports/user-teams-1-day"
-    params = {"day": day_str}
-    response = requests.get(url, headers=headers, params=params, timeout=30)
-
-    if response.status_code == 200:
-        data = response.json()
-        if not isinstance(data, dict):
-            print(f"Warning: Unexpected response format for user-teams report on {day_str}. Skipping.")
-        else:
-            download_links = data.get("download_links", [])
-            if download_links:
-                return download_ndjson(download_links)
-    elif response.status_code != 204:
-        print(f"Note: User-teams report not available ({response.status_code}). Team data will not be included.")
-
     return []
 
 
@@ -379,28 +337,32 @@ def process_user_report_data(user_data, user_teams_data):
 def process_metrics_data(metrics_data):
     """
     Process metrics API data for detailed breakdowns.
+    Extracts unique users from total_active_users and supports both
+    total_credits_consumed (newer API) and total_ai_tokens (proxy) fields.
     """
     total_credits = 0
-    unique_users = set()
     cost_center_credits = defaultdict(lambda: {"credits": 0, "users": set()})
     model_credits = defaultdict(float)
+    unique_users_max = 0  # Maximum daily active users as monthly unique-user estimate
 
     for day_data in metrics_data:
+        daily_users = day_data.get("total_active_users", 0) or 0
+        if daily_users > unique_users_max:
+            unique_users_max = daily_users
+
         copilot_ide_code_completions = day_data.get("copilot_ide_code_completions", {})
         copilot_ide_chat = day_data.get("copilot_ide_chat", {})
         copilot_dotcom_chat = day_data.get("copilot_dotcom_chat", {})
         copilot_dotcom_pull_requests = day_data.get("copilot_dotcom_pull_requests", {})
-
-        total_engaged = day_data.get("total_active_users", 0)
 
         # Process code completions
         if copilot_ide_code_completions:
             for editor_data in copilot_ide_code_completions.get("editors", []):
                 for model_data in editor_data.get("models", []):
                     model_name = model_data.get("name", "Unknown")
-                    languages = model_data.get("languages", [])
-                    for lang in languages:
-                        credits = lang.get("total_credits_consumed", 0) or 0
+                    for lang in model_data.get("languages", []):
+                        credits = (lang.get("total_credits_consumed") or
+                                   lang.get("total_ai_tokens") or 0)
                         total_credits += credits
                         model_credits[model_name] += credits
 
@@ -409,7 +371,8 @@ def process_metrics_data(metrics_data):
             for editor_data in copilot_ide_chat.get("editors", []):
                 for model_data in editor_data.get("models", []):
                     model_name = model_data.get("name", "Unknown")
-                    credits = model_data.get("total_credits_consumed", 0) or 0
+                    credits = (model_data.get("total_credits_consumed") or
+                               model_data.get("total_ai_tokens") or 0)
                     total_credits += credits
                     model_credits[model_name] += credits
 
@@ -417,7 +380,8 @@ def process_metrics_data(metrics_data):
         if copilot_dotcom_chat:
             for model_data in copilot_dotcom_chat.get("models", []):
                 model_name = model_data.get("name", "Unknown")
-                credits = model_data.get("total_credits_consumed", 0) or 0
+                credits = (model_data.get("total_credits_consumed") or
+                           model_data.get("total_ai_tokens") or 0)
                 total_credits += credits
                 model_credits[model_name] += credits
 
@@ -425,12 +389,15 @@ def process_metrics_data(metrics_data):
         if copilot_dotcom_pull_requests:
             for model_data in copilot_dotcom_pull_requests.get("models", []):
                 model_name = model_data.get("name", "Unknown")
-                credits = model_data.get("total_credits_consumed", 0) or 0
+                credits = (model_data.get("total_credits_consumed") or
+                           model_data.get("total_ai_tokens") or 0)
                 total_credits += credits
                 model_credits[model_name] += credits
 
     return {
         "total_credits": total_credits,
+        "unique_users": unique_users_max,
+        "cost_center_breakdown": cost_center_credits,
         "model_breakdown": model_credits
     }
 
@@ -447,10 +414,18 @@ def generate_report(report_data, billing_data, month_name):
     # Get pooled credits from billing data
     pooled_credits = "N/A"
     if billing_data:
-        seat_count = billing_data.get("total_seats", 0)
-        # Premium requests per seat per month (as per GitHub's allocation)
-        premium_per_seat = billing_data.get("premium_requests_per_seat", 0)
-        pooled_credits = seat_count * premium_per_seat if premium_per_seat else "N/A"
+        # Support both top-level total_seats and nested seat_breakdown.total
+        seat_breakdown = billing_data.get("seat_breakdown", {})
+        seat_count = (billing_data.get("total_seats") or
+                      seat_breakdown.get("total") or 0)
+        # Use explicit field if GitHub returns it; otherwise fall back to seat count only
+        total_included = (billing_data.get("total_included_ai_credits") or
+                          billing_data.get("included_credits"))
+        if total_included:
+            pooled_credits = total_included
+        elif seat_count:
+            premium_per_seat = billing_data.get("premium_requests_per_seat", 0)
+            pooled_credits = seat_count * premium_per_seat if premium_per_seat else "N/A"
 
     report_lines = []
     report_lines.append(f"GitHub Copilot USAGE SUMMARY REPORT - {month_name.upper()}")
@@ -458,12 +433,12 @@ def generate_report(report_data, billing_data, month_name):
     report_lines.append("")
     report_lines.append("OVERALL METRICS")
     report_lines.append("-" * 40)
-    report_lines.append(f"  Total AI Credits Used:   {total_credits:,.2f}")
-    report_lines.append(f"  Total Unique Users:      {unique_users:,}")
     if pooled_credits != "N/A":
         report_lines.append(f"  Pooled Credits (Allocated): {pooled_credits:,}")
     else:
         report_lines.append(f"  Pooled Credits (Allocated): {pooled_credits}")
+    report_lines.append(f"  Total AI Credits Used:   {total_credits:,.2f}")
+    report_lines.append(f"  Total Unique Users:      {unique_users:,}")
     report_lines.append("")
     report_lines.append("")
 
@@ -524,9 +499,9 @@ def generate_report(report_data, billing_data, month_name):
     writer.writerow(["GitHub Copilot USAGE SUMMARY REPORT", month_name.upper()])
     writer.writerow([])
     writer.writerow(["OVERALL METRICS"])
+    writer.writerow(["Pooled Credits (Allocated)", pooled_credits])
     writer.writerow(["Total AI Credits Used", f"{total_credits:.2f}"])
     writer.writerow(["Total Unique Users", unique_users])
-    writer.writerow(["Pooled Credits (Allocated)", pooled_credits])
     writer.writerow([])
 
     # Cost Center breakdown
@@ -593,8 +568,8 @@ def main():
         org_processed = process_metrics_data(org_report_data)
         report_data = {
             "total_credits": org_processed["total_credits"],
-            "unique_users": 0,
-            "cost_center_breakdown": {},
+            "unique_users": org_processed["unique_users"],
+            "cost_center_breakdown": org_processed.get("cost_center_breakdown", {}),
             "model_breakdown": org_processed["model_breakdown"]
         }
     else:
@@ -628,6 +603,8 @@ def main():
         org_processed = process_metrics_data(org_report_data)
         if org_processed["total_credits"] > report_data["total_credits"]:
             report_data["total_credits"] = org_processed["total_credits"]
+        if org_processed["unique_users"] > report_data["unique_users"]:
+            report_data["unique_users"] = org_processed["unique_users"]
 
     # Generate the report
     report_text, csv_text = generate_report(report_data, billing_data, month_name)
