@@ -43,8 +43,11 @@ def extract_download_links(api_data):
     # Some responses return a direct signed URL or a list of URLs
     if isinstance(api_data, str):
         return [api_data]
-    if isinstance(api_data, list) and all(isinstance(item, str) for item in api_data):
-        return api_data
+    if isinstance(api_data, list):
+        if not api_data:
+            return []
+        if all(isinstance(item, str) for item in api_data):
+            return api_data
 
     return []
 
