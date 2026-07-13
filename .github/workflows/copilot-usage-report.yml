@@ -1,0 +1,96 @@
+name: GitHub Copilot Usage Report
+
+on:
+  # Scheduled: 1st of every month at 8:30 AM IST (3:00 AM UTC)
+  schedule:
+    - cron: '0 3 1 * *'
+
+  # Manual trigger with month selection
+  workflow_dispatch:
+    inputs:
+      month_selection:
+        description: 'Select the month for the report'
+        required: true
+        type: choice
+        options:
+          - last_month
+          - current_month
+          - '2026-06'
+          - '2026-05'
+          - '2026-04'
+          - '2026-03'
+          - '2026-02'
+          - '2026-01'
+          - '2025-12'
+          - '2025-11'
+          - '2025-10'
+          - '2025-09'
+        default: 'last_month'
+
+env:
+  GITHUB_ORG: ${{ github.repository_owner }}
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      organization-administration: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Determine month selection
+        id: month
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "selection=${{ github.event.inputs.month_selection }}" >> $GITHUB_OUTPUT
+          else
+            # Scheduled run: generate report for last month
+            echo "selection=last_month" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Copilot Usage Report
+        id: report
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_ADMIN_TOKEN }}
+          GITHUB_ORG: ${{ env.GITHUB_ORG }}
+          MONTH_SELECTION: ${{ steps.month.outputs.selection }}
+        run: python scripts/generate_copilot_report.py
+
+      - name: Upload Report Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: copilot-usage-report-${{ steps.month.outputs.selection }}
+          path: reports/
+          retention-days: 90
+
+      - name: Send Email Report
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "GitHub Copilot Usage Report - ${{ steps.report.outputs.month_name }}"
+          to: ${{ secrets.REPORT_RECIPIENTS }}
+          from: ${{ secrets.SMTP_FROM_EMAIL }}
+          body: |
+            Hi Team,
+
+            Please find the GitHub Copilot Usage Summary Report for ${{ steps.report.outputs.month_name }} attached.
+
+            This is an automated report generated on the 1st of every month.
+
+            Regards,
+            GitHub Actions Bot
+          attachments: reports/*
