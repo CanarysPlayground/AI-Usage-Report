@@ -555,6 +555,18 @@ def process_usage_data(usage_data):
     }
 
 
+def _extract_username(record):
+    """Extract a username from a user data record, handling multiple formats."""
+    username = record.get("login") or record.get("user_login") or ""
+    if not username:
+        user_field = record.get("user")
+        if isinstance(user_field, dict):
+            username = user_field.get("login", "")
+        elif user_field:
+            username = str(user_field)
+    return username or "Unknown"
+
+
 def process_user_report_data(user_data, user_teams_data):
     """
     Process user-level report data (NDJSON) to extract per-user and per-team breakdowns.
@@ -576,11 +588,7 @@ def process_user_report_data(user_data, user_teams_data):
             user_team_map[login] = team
 
     for record in user_data:
-        username = (record.get("login") or record.get("user_login") or
-                    record.get("user", {}).get("login", "") if isinstance(record.get("user"), dict)
-                    else str(record.get("user", "Unknown")))
-        if not username:
-            username = "Unknown"
+        username = _extract_username(record)
         unique_users.add(username)
         team = user_team_map.get(username, "Not Assigned")
 
@@ -740,8 +748,7 @@ def process_per_user_metrics(user_metrics_data, seats_data=None):
                 user_org_map[login] = org or "Not Assigned"
 
     for record in user_metrics_data:
-        username = (record.get("user_login") or record.get("login") or
-                    "Unknown")
+        username = _extract_username(record)
         credits = float(record.get("ai_credits_used", 0) or 0)
         org = record.get("organization") or user_org_map.get(username, "Not Assigned")
 
@@ -981,11 +988,14 @@ def generate_report(report_data, billing_data, month_name):
         else:
             # Fall back to seat count × credits per seat
             seat_breakdown = billing_data.get("seat_breakdown", {})
-            seat_count = (billing_data.get("total_seats") or
-                          seat_breakdown.get("total") or 0)
             if isinstance(seat_breakdown, list):
                 # New format: seat_breakdown is a list of seat objects
                 seat_count = len(seat_breakdown)
+            elif isinstance(seat_breakdown, dict):
+                seat_count = (billing_data.get("total_seats") or
+                              seat_breakdown.get("total") or 0)
+            else:
+                seat_count = billing_data.get("total_seats") or 0
 
             if seat_count:
                 premium_per_seat = (
