@@ -35,24 +35,24 @@ def extract_download_links(api_data):
     if isinstance(api_data, dict):
         links = api_data.get("download_links", [])
         if isinstance(links, str):
-            return [links]
+            return [links] if links.strip() else []
         if isinstance(links, list):
-            valid_links = [link for link in links if isinstance(link, str)]
+            valid_links = [link for link in links if isinstance(link, str) and link.strip()]
             if len(valid_links) != len(links):
-                print("Warning: Ignoring non-string values in download_links response.")
+                print("Warning: Ignoring non-string or empty values in download_links response.")
             return valid_links
         return []
 
     # Some responses return a direct signed URL or a list of URLs
     if isinstance(api_data, str):
-        return [api_data]
+        return [api_data] if api_data.strip() else []
     if isinstance(api_data, list):
         if not api_data:
             return []
-        valid_links = [item for item in api_data if isinstance(item, str)]
+        valid_links = [item for item in api_data if isinstance(item, str) and item.strip()]
         invalid_count = len(api_data) - len(valid_links)
         if invalid_count:
-            print(f"Warning: Ignoring {invalid_count} non-string values in download link list response.")
+            print(f"Warning: Ignoring {invalid_count} non-string or empty values in download link list response.")
         return valid_links
 
     return []
@@ -265,6 +265,9 @@ def download_ndjson(download_links):
     """Download and parse NDJSON files from signed URLs."""
     all_data = []
     for url in download_links:
+        if not url.strip():
+            print("Warning: Skipping empty download URL.")
+            continue
         # Signed URLs do not require authentication headers
         response = requests.get(url, timeout=60)
         if response.status_code == 200:
