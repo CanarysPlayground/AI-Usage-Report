@@ -37,7 +37,10 @@ def extract_download_links(api_data):
         if isinstance(links, str):
             return [links]
         if isinstance(links, list):
-            return [link for link in links if isinstance(link, str)]
+            valid_links = [link for link in links if isinstance(link, str)]
+            if len(valid_links) != len(links):
+                print("Warning: Ignoring non-string values in download_links response.")
+            return valid_links
         return []
 
     # Some responses return a direct signed URL or a list of URLs
@@ -48,6 +51,7 @@ def extract_download_links(api_data):
             return []
         if all(isinstance(item, str) for item in api_data):
             return api_data
+        print("Warning: Ignoring non-string values in download link list response.")
 
     return []
 
@@ -55,7 +59,10 @@ def extract_download_links(api_data):
 def extract_inline_records(api_data):
     """Extract inline metric records when API returns a list of objects."""
     if isinstance(api_data, list):
-        return [item for item in api_data if isinstance(item, dict)]
+        records = [item for item in api_data if isinstance(item, dict)]
+        if len(records) != len(api_data):
+            print("Warning: Ignoring non-object inline metric records.")
+        return records
     return []
 
 
