@@ -49,10 +49,11 @@ def extract_download_links(api_data):
     if isinstance(api_data, list):
         if not api_data:
             return []
-        if all(isinstance(item, str) for item in api_data):
-            return api_data
-        invalid_count = len([item for item in api_data if not isinstance(item, str)])
-        print(f"Warning: Ignoring {invalid_count} non-string values in download link list response.")
+        valid_links = [item for item in api_data if isinstance(item, str)]
+        invalid_count = len(api_data) - len(valid_links)
+        if invalid_count:
+            print(f"Warning: Ignoring {invalid_count} non-string values in download link list response.")
+        return valid_links
 
     return []
 
