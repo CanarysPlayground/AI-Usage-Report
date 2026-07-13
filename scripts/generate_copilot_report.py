@@ -1012,27 +1012,77 @@ def _get_user_count(cost_center_data):
     return cost_center_data.get("user_count") or len(cost_center_data.get("users", set()))
 
 
-# Default AI-credits-per-seat used when the billing API does not return the value.
-# As of June 2026, GitHub Copilot Enterprise includes 3,500 AI credits / seat / month.
-# Verify against https://docs.github.com/en/billing/managing-billing-for-your-products/
-# managing-billing-for-github-copilot/about-billing-for-github-copilot when upgrading.
-_DEFAULT_AI_CREDITS_PER_SEAT = 3500
+# ---------------------------------------------------------------------------
+# AI credits per assigned seat per month – values from GitHub official docs:
+# https://docs.github.com/en/copilot/concepts/billing/
+#         usage-based-billing-for-organizations-and-enterprises
+# ---------------------------------------------------------------------------
+
+# Standard (post-promo) rates
+_AI_CREDITS_PER_SEAT = {
+    "enterprise": 3900,
+    "business":   1900,
+}
+_AI_CREDITS_PER_SEAT_DEFAULT = 1900  # fallback when plan_type is unknown
+
+# Promotional rates for existing customers: June 1 – September 1, 2026
+_AI_CREDITS_PER_SEAT_PROMO = {
+    "enterprise": 7000,
+    "business":   3000,
+}
+_AI_CREDITS_PROMO_START = datetime(2026, 6, 1)
+_AI_CREDITS_PROMO_END   = datetime(2026, 9, 1)  # exclusive (promo ends Aug 31)
 
 # AI credits billing model was introduced in June 2026.
 # Do not attempt to report AI credits for months before this date.
 _AI_CREDITS_MIN_DATE = datetime(2026, 6, 1)
 
 
-def generate_report(report_data, billing_data, month_name, seats_data=None):
+def compute_included_credits(seats_data, billing_month_start):
+    """
+    Compute the total pooled (allocated) AI credits for a billing month.
+
+    Each seat contributes credits based on its plan_type (business or enterprise)
+    and whether the billing month falls within the promotional period
+    (June 1 – September 1, 2026).  Credits are pooled at the enterprise level,
+    so this returns the enterprise-wide pool for the month.
+
+    Args:
+        seats_data:           List of seat objects from the Copilot seats API.
+                              Each object must have a ``plan_type`` field.
+        billing_month_start:  datetime for the first day of the billing month.
+
+    Returns:
+        int  – total AI credits in the pool, or None if seats_data is empty.
+    """
+    if not seats_data:
+        return None
+
+    is_promo = _AI_CREDITS_PROMO_START <= billing_month_start < _AI_CREDITS_PROMO_END
+    rates = _AI_CREDITS_PER_SEAT_PROMO if is_promo else _AI_CREDITS_PER_SEAT
+
+    total = 0
+    for seat in seats_data:
+        plan = (seat.get("plan_type") or "").lower().strip()
+        rate = rates.get(plan, _AI_CREDITS_PER_SEAT_DEFAULT)
+        total += rate
+
+    return total
+
+
+def generate_report(report_data, billing_data, month_name,
+                    seats_data=None, billing_start_date=None):
     """
     Generate the usage report as a formatted string and CSV.
 
     Args:
-        report_data:   Aggregated metrics (total_credits, unique_users, breakdowns).
-        billing_data:  Raw response from the Copilot billing API (may be None).
-        month_name:    Human-readable month string, e.g. "June 2026".
-        seats_data:    List of seat objects from the Copilot seats API.  Used to
-                       build the licensed-users list shown in the report.
+        report_data:          Aggregated metrics (total_credits, unique_users, breakdowns).
+        billing_data:         Raw response from the Copilot billing API (may be None).
+        month_name:           Human-readable month string, e.g. "June 2026".
+        seats_data:           List of seat objects from the Copilot seats API.  Used to
+                              build the licensed-users list and compute pooled credits.
+        billing_start_date:   datetime for the first day of the billing month.  Required
+                              to select the correct AI-credit rate (promo vs standard).
     """
     total_credits = report_data["total_credits"]
     unique_users = report_data["unique_users"]
@@ -1081,38 +1131,25 @@ def generate_report(report_data, billing_data, month_name, seats_data=None):
 
         if total_included:
             pooled_credits = int(total_included)
-        else:
-            # Fall back to seat count × credits per seat.
-            seat_breakdown = billing_data.get("seat_breakdown", {})
-            if isinstance(seat_breakdown, list):
-                seat_count = len(seat_breakdown)
-            elif isinstance(seat_breakdown, dict):
-                seat_count = (billing_data.get("total_seats") or
-                              seat_breakdown.get("total") or 0)
-            else:
-                seat_count = billing_data.get("total_seats") or 0
 
-            # Also use the authoritative seats list if the billing API seat count is 0
-            if not seat_count and seats_data:
-                seat_count = len(seats_data)
+    # If the billing API didn't return a pool size, compute it from the seats
+    # list using the per-plan-type credit rates from the GitHub docs.
+    # Rates differ between Copilot Business and Copilot Enterprise, and a
+    # promotional 3x-to-4x boost applies June 1 – September 1, 2026.
+    if pooled_credits == "N/A" and seats_data and billing_start_date:
+        computed = compute_included_credits(seats_data, billing_start_date)
+        if computed:
+            pooled_credits = computed
+            is_promo = (_AI_CREDITS_PROMO_START <= billing_start_date
+                        < _AI_CREDITS_PROMO_END)
+            period_label = "promotional" if is_promo else "standard"
+            print(f"Note: Pooled credits computed from {len(seats_data)} seat(s) "
+                  f"using {period_label} per-plan rates → {pooled_credits:,}")
 
-            if seat_count:
-                premium_per_seat = (
-                    billing_data.get("ai_credits_per_seat") or
-                    billing_data.get("premium_requests_per_seat") or
-                    billing_data.get("included_requests_per_seat")
-                )
-                if premium_per_seat:
-                    pooled_credits = int(seat_count * premium_per_seat)
-                else:
-                    pooled_credits = int(seat_count * _DEFAULT_AI_CREDITS_PER_SEAT)
-                    print(f"Note: AI credits per seat not in billing response. "
-                          f"Using default {_DEFAULT_AI_CREDITS_PER_SEAT} AI credits/seat. "
-                          f"Total seats: {seat_count}")
-            else:
-                print("Warning: Could not determine seat count or included_ai_credits "
-                      "from billing API response. Pooled Credits will show as N/A. "
-                      f"Billing API fields present: {list(billing_data.keys())}")
+    if pooled_credits == "N/A" and billing_data:
+        print("Warning: Could not determine pooled (allocated) AI credits. "
+              "The billing API did not return an included_ai_credits field and "
+              "no seats data was available to compute the pool.")
 
     report_lines = []
     report_lines.append(f"GitHub Copilot USAGE SUMMARY REPORT - {month_name.upper()}")
@@ -1317,7 +1354,7 @@ def main():
     print("Fetching billing information...")
     billing_data = fetch_copilot_billing(enterprise, token)
     if billing_data:
-        print(f"  Billing API fields returned: {list(billing_data.keys())}")
+        print(f"  Billing API responded with {len(billing_data)} top-level fields.")
 
     # 1b. Copilot seat assignments → accurate licensed user count
     print("Fetching Copilot seat assignments...")
@@ -1507,7 +1544,8 @@ def main():
 
     # Generate the report
     report_text, csv_text = generate_report(
-        report_data, billing_data, month_name, seats_data
+        report_data, billing_data, month_name, seats_data,
+        billing_start_date=start_date
     )
 
     # Print report to console
