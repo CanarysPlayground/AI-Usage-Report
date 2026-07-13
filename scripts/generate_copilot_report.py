@@ -92,15 +92,19 @@ def fetch_copilot_usage(org, token, start_date, end_date):
                 break
             page += 1
         elif response.status_code == 404:
-            print("Error: Organization not found or Copilot usage API not available.")
-            print("Ensure the organization has Copilot enabled and the token has appropriate permissions.")
-            sys.exit(1)
+            print("Warning: Copilot usage data not available for this organization.")
+            print("The organization may not have GitHub Copilot enabled, or the token may lack sufficient permissions.")
+            print("Generating report with no usage data.")
+            return []
         elif response.status_code == 403:
-            print("Error: Access forbidden. Ensure the token has 'manage_billing:copilot' or 'org:read' scope.")
-            sys.exit(1)
+            print("Warning: Access forbidden when fetching Copilot usage data.")
+            print("Ensure the token has 'manage_billing:copilot' or 'read:org' scope.")
+            print("Generating report with no usage data.")
+            return []
         else:
-            print(f"Error fetching usage data: {response.status_code} - {response.text}")
-            sys.exit(1)
+            print(f"Warning: Unexpected response fetching usage data: {response.status_code} - {response.text}")
+            print("Generating report with no usage data.")
+            return []
 
     return all_usage_data
 
