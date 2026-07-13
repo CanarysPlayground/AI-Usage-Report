@@ -1035,7 +1035,8 @@ def _has_named_models(model_breakdown):
         return False
 
     for model_name in model_breakdown.keys():
-        normalized = str(model_name or "").strip().lower()
+        model_name_str = "" if model_name is None else str(model_name)
+        normalized = model_name_str.strip().lower()
         if normalized not in ("", "unknown", "unknown model"):
             return True
 
@@ -1062,11 +1063,11 @@ def _enrich_cost_center_users(cost_center_breakdown, per_user_org_breakdown, per
 
     for center, data in cost_center_breakdown.items():
         entry = dict(data)
-        users = set(entry.get("users", set()))
+        users = set(entry.get("users") or [])
 
         org_entry = per_user_org_breakdown.get(center)
         if isinstance(org_entry, dict):
-            org_users = org_entry.get("users", set())
+            org_users = org_entry.get("users") or set()
             if isinstance(org_users, set) and org_users:
                 users.update(org_users)
                 matched_any_center = True
@@ -1076,8 +1077,11 @@ def _enrich_cost_center_users(cost_center_breakdown, per_user_org_breakdown, per
             entry["user_count"] = len(users)
         enriched[center] = entry
 
-    if (not matched_any_center and "Not Assigned" in enriched and
-            len(enriched) == 1 and per_user_unique_users > 0):
+    should_use_not_assigned_fallback = (
+        not matched_any_center and "Not Assigned" in enriched and
+        len(enriched) == 1 and per_user_unique_users > 0
+    )
+    if should_use_not_assigned_fallback:
         enriched["Not Assigned"]["user_count"] = per_user_unique_users
 
     return enriched
