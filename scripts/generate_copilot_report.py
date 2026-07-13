@@ -1035,8 +1035,7 @@ def _has_named_models(model_breakdown):
         return False
 
     for model_name in model_breakdown.keys():
-        model_name_str = "" if model_name is None else str(model_name)
-        normalized = model_name_str.strip().lower()
+        normalized = str(model_name or "").strip().lower()
         if normalized not in ("", "unknown", "unknown model"):
             return True
 
@@ -1063,11 +1062,23 @@ def _enrich_cost_center_users(cost_center_breakdown, per_user_org_breakdown, per
 
     for center, data in cost_center_breakdown.items():
         entry = dict(data)
-        users = set(entry.get("users") or [])
+        users_value = entry.get("users")
+        if isinstance(users_value, set):
+            users = set(users_value)
+        elif isinstance(users_value, (list, tuple)):
+            users = set(users_value)
+        else:
+            users = set()
 
         org_entry = per_user_org_breakdown.get(center)
         if isinstance(org_entry, dict):
-            org_users = org_entry.get("users") or set()
+            org_users_value = org_entry.get("users")
+            if isinstance(org_users_value, set):
+                org_users = set(org_users_value)
+            elif isinstance(org_users_value, (list, tuple)):
+                org_users = set(org_users_value)
+            else:
+                org_users = set()
             if isinstance(org_users, set) and org_users:
                 users.update(org_users)
                 matched_any_center = True
