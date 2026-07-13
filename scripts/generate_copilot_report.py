@@ -562,12 +562,19 @@ def process_billing_usage_data(billing_usage, cost_centers):
         unit_type = (item.get("unitType") or "").lower()
 
         # Match Copilot AI credit / premium-request line items.
-        # GitHub billing SKUs observed: "Copilot Premium Requests",
-        # "Copilot AI Credits", "Copilot Add-on Premium Requests", etc.
+        # Known GitHub billing SKUs (as of 2025):
+        #   "Copilot Premium Requests"          – standard included AI credits
+        #   "Copilot Add-on Premium Requests"   – additional (paid) AI credits
+        #   "Copilot AI Credits"                – alternative SKU name
+        #   "Copilot Premium Model Requests"    – premium model variant
+        # We require the item to be Copilot-branded AND to reference one of the
+        # specific AI-credit-related SKU phrases to avoid matching seat/license
+        # or other Copilot line items (e.g. "Copilot for Business Seat").
         is_copilot = "copilot" in product or "copilot" in sku
         is_ai_usage = any(kw in sku for kw in (
-            "premium request", "ai credit", "premium model", "premium"
-        )) or any(kw in unit_type for kw in ("credit", "request"))
+            "premium request", "ai credit", "premium model",
+            "add-on premium", "addon premium"
+        )) or unit_type in ("credit", "request", "credits", "requests")
 
         if not (is_copilot and is_ai_usage):
             continue
@@ -651,6 +658,26 @@ def build_cost_center_metrics(cost_centers, token, start_date, end_date):
     return cost_center_credits
 
 
+def _get_user_count(cost_center_data):
+    """
+    Return the user count for a cost-center data dict.
+
+    Two paths populate cost-center entries:
+    - process_billing_usage_data / process_user_report_data: fills the `users` set
+    - build_cost_center_metrics: sets `user_count` as a plain integer (no set members)
+
+    This helper checks both so callers don't need to repeat the logic.
+    """
+    return cost_center_data.get("user_count") or len(cost_center_data.get("users", set()))
+
+
+# Default AI-credits-per-seat used when the billing API does not return the value.
+# Copilot Business and Enterprise both include 100 AI credits / seat / month as of 2025.
+# Verify against https://docs.github.com/en/billing/managing-billing-for-your-products/
+# managing-billing-for-github-copilot/about-billing-for-github-copilot when upgrading.
+_DEFAULT_AI_CREDITS_PER_SEAT = 100
+
+
 def generate_report(report_data, billing_data, month_name):
     """
     Generate the usage report as a formatted string and CSV.
@@ -683,7 +710,7 @@ def generate_report(report_data, billing_data, month_name):
             pooled_credits = int(total_included)
         elif seat_count:
             # GitHub Copilot seats include a monthly AI-credits allocation.
-            # Try the per-seat field; fall back to common plan defaults.
+            # Try the per-seat field; fall back to the module-level constant.
             premium_per_seat = (
                 billing_data.get("premium_requests_per_seat") or
                 billing_data.get("included_requests_per_seat") or
@@ -692,15 +719,9 @@ def generate_report(report_data, billing_data, month_name):
             if premium_per_seat:
                 pooled_credits = int(seat_count * premium_per_seat)
             else:
-                # GitHub Copilot plans include a monthly AI-credits allocation per seat:
-                #   Business:   100 AI credits / seat / month  (observed default)
-                #   Enterprise: may vary; also typically ~100 AI credits / seat / month
-                # If the billing API does not return the per-seat value, we fall back
-                # to 100, which matches the ecanarys enterprise (580 seats × 100 = 58 000).
-                default_credits_per_seat = 100
-                pooled_credits = int(seat_count * default_credits_per_seat)
+                pooled_credits = int(seat_count * _DEFAULT_AI_CREDITS_PER_SEAT)
                 print(f"Note: 'premium_requests_per_seat' not in billing response. "
-                      f"Using default {default_credits_per_seat} AI credits/seat. "
+                      f"Using default {_DEFAULT_AI_CREDITS_PER_SEAT} AI credits/seat. "
                       f"Total seats: {seat_count}")
 
     report_lines = []
@@ -734,10 +755,7 @@ def generate_report(report_data, billing_data, month_name):
     total_center_users = 0
     for center, data in sorted_centers:
         credits = data["credits"]
-        # Prefer the explicit user_count field (set by build_cost_center_metrics)
-        # when the users set is empty (cost-center fallback path); otherwise use
-        # the set length (populated by process_billing_usage_data / user-report path).
-        users = data.get("user_count") or len(data.get("users", set()))
+        users = _get_user_count(data)
         total_center_credits += credits
         total_center_users += users
         report_lines.append(f"  {center:<30} {credits:>18,.2f} {users:>8}")
@@ -789,8 +807,7 @@ def generate_report(report_data, billing_data, month_name):
     writer.writerow(["COST CENTER WISE AI CREDIT USAGE"])
     writer.writerow(["Cost Center", "Total AI Credits", "Users"])
     for center, data in sorted_centers:
-        users = data.get("user_count") or len(data.get("users", set()))
-        writer.writerow([center, f"{data['credits']:.2f}", users])
+        writer.writerow([center, f"{data['credits']:.2f}", _get_user_count(data)])
     writer.writerow(["TOTAL", f"{total_center_credits:.2f}", total_center_users])
     writer.writerow([])
 
@@ -868,8 +885,15 @@ def main():
                 report_data["model_breakdown"] = metrics_processed["model_breakdown"]
             if metrics_processed["unique_users"] > report_data["unique_users"]:
                 report_data["unique_users"] = metrics_processed["unique_users"]
-            # If metrics total is higher (more recent / not yet billed), prefer it
+            # The metrics API reflects near-real-time usage that may not yet be
+            # reflected in the billing system (processing lag).  When the metrics
+            # total is higher, we use it as the more up-to-date figure.  Note:
+            # billing data is authoritative for invoicing; metrics is used here
+            # solely to avoid under-reporting during the billing lag window.
             if metrics_processed["total_credits"] > report_data["total_credits"]:
+                print(f"Note: Metrics API total ({metrics_processed['total_credits']:,.2f}) "
+                      f"is higher than billing total ({report_data['total_credits']:,.2f}). "
+                      f"Using metrics total (may include usage not yet reflected in billing).")
                 report_data["total_credits"] = metrics_processed["total_credits"]
 
         # If billing usage had no cost-center labels on its items,
