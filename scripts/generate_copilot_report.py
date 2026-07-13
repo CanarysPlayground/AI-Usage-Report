@@ -602,20 +602,27 @@ def process_billing_usage_data(billing_usage, cost_centers):
             cc_name = "Not Assigned"
 
         # Determine if this is included or additional credit
-        # "add-on" or "addon" in SKU = additional credits
-        is_additional = any(kw in sku for kw in ("add-on", "addon"))
+        # GitHub's add-on SKUs are specifically prefixed with "Copilot Add-on" or "Copilot Addon"
+        # Check for these standard patterns to distinguish paid add-on credits from included credits
+        # Using lowercase keywords since sku was already lowercased
+        is_additional = "add-on premium" in sku or "addon premium" in sku
 
-        # Extract model name if available (from line_description or other fields)
-        model_name = (
-            item.get("modelName") or
-            item.get("model_name") or
-            item.get("model") or
-            "Unknown Model"
-        )
+        # Extract model name if available
+        # The GitHub billing API may include model information in different field names
+        # depending on the API version and response format:
+        # - modelName/model_name: Standard field names for AI model identification
+        # - model: Alternative field name
+        # Defaults to "Unknown Model" if no model field is present in the billing item
+        model_name = "Unknown Model"
+        for field in ("modelName", "model_name", "model"):
+            value = item.get(field, "").strip()
+            if value:
+                model_name = value
+                break
 
         total_credits += quantity
         cost_center_credits[cc_name]["credits"] += quantity
-        
+
         # Track model breakdown with included/additional distinction
         model_data = model_breakdown[model_name]
         model_data["total"] += quantity
@@ -634,7 +641,7 @@ def process_billing_usage_data(billing_usage, cost_centers):
         "cost_center_breakdown": dict(cost_center_credits),
         "model_breakdown": dict(model_breakdown)
     }
-    
+
     return result
 
 
@@ -795,6 +802,9 @@ def generate_report(report_data, billing_data, month_name):
     report_lines.append("")
     report_lines.append("")
 
+    # Determine format early for consistent use in both text and CSV
+    has_detailed_format = any(isinstance(data, dict) for data in model_breakdown.values())
+
     # Model wise breakdown
     report_lines.append("MODEL WISE AI CREDIT USAGE")
     report_lines.append("-" * 90)
@@ -810,8 +820,9 @@ def generate_report(report_data, billing_data, month_name):
             # Old format - just a float total
             total = model_data
         sorted_models.append((model_name, model_data, total))
-    
-    sorted_models.sort(key=lambda x: x[2], reverse=True)
+
+    # Sort by total credits in descending order
+    sorted_models = sorted(sorted_models, key=lambda x: x[2], reverse=True)
 
     total_model_credits = 0
     total_included = 0.0
@@ -832,7 +843,8 @@ def generate_report(report_data, billing_data, month_name):
             report_lines.append(f"  {model_name:<30} {'-':>15} {'-':>15} {total:>15,.2f}")
 
     report_lines.append(f"  {'-'*30} {'-'*15} {'-'*15} {'-'*15}")
-    if isinstance(list(model_breakdown.values())[0] if model_breakdown else None, dict):
+    # Use has_detailed_format computed earlier
+    if has_detailed_format:
         report_lines.append(
             f"  {'TOTAL':<30} {total_included:>15,.2f} {total_additional:>15,.2f} {total_model_credits:>15,.2f}"
         )
@@ -865,7 +877,11 @@ def generate_report(report_data, billing_data, month_name):
 
     # Model breakdown
     writer.writerow(["MODEL WISE AI CREDIT USAGE"])
-    if sorted_models and isinstance(sorted_models[0][1], dict):
+    # Write model breakdown based on format:
+    # - If detailed format (included/additional) is available: write detailed columns
+    # - Else if models exist: write simple total columns
+    # - Else: write detailed header for consistency with text report
+    if has_detailed_format and sorted_models:
         # New format with included/additional breakdown
         writer.writerow(["Model Name", "Included Credits", "Additional Credits", "Gross Amount"])
         for model_name, model_data, total in sorted_models:
@@ -874,12 +890,15 @@ def generate_report(report_data, billing_data, month_name):
                 additional = model_data.get("additional", 0.0)
                 writer.writerow([model_name, f"{included:.2f}", f"{additional:.2f}", f"{total:.2f}"])
         writer.writerow(["TOTAL", f"{total_included:.2f}", f"{total_additional:.2f}", f"{total_model_credits:.2f}"])
-    else:
-        # Old format - just total
+    elif sorted_models:
+        # Old format - just total (from metrics API, no included/additional breakdown)
         writer.writerow(["Model Name", "Total AI Credits"])
         for model_name, model_data, total in sorted_models:
             writer.writerow([model_name, f"{total:.2f}"])
         writer.writerow(["TOTAL", f"{total_model_credits:.2f}"])
+    else:
+        # No models available - write header only
+        writer.writerow(["Model Name", "Included Credits", "Additional Credits", "Gross Amount"])
 
     csv_text = csv_output.getvalue()
 
