@@ -1195,8 +1195,8 @@ def compute_included_credits_from_billing(billing_data, billing_month_start):
 
     total = active_seats * rate
     period_label = "promotional" if is_promo else "standard"
-    print(f"  Allocated credits: {active_seats} active seat(s) × "
-          f"{rate:,} ({plan}, {period_label}) = {total:,}")
+    print(f"  Allocated credits: {active_seats} active seat(s) "
+          f"× {rate:,} ({period_label} rate) = {total:,}")
     return total
 
 
