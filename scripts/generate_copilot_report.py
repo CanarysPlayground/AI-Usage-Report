@@ -1201,7 +1201,7 @@ def compute_included_credits_from_billing(billing_data, billing_month_start):
 
 
 def generate_report(report_data, billing_data, month_name,
-                    seats_data=None, billing_start_date=None):
+                    seats_data=None, billing_start_date=None, is_current_month=False):
     """
     Generate the usage report as a formatted string and CSV.
 
@@ -1213,6 +1213,10 @@ def generate_report(report_data, billing_data, month_name,
                               build the licensed-users list and compute pooled credits.
         billing_start_date:   datetime for the first day of the billing month.  Required
                               to select the correct AI-credit rate (promo vs standard).
+        is_current_month:     True when the selected month is the current billing cycle.
+                              The Copilot billing API only returns live data for the
+                              current cycle; for historical months its included_ai_credits
+                              field reflects the current seat count, not the historical one.
     """
     total_credits = report_data["total_credits"]
     unique_users = report_data["unique_users"]
@@ -1222,8 +1226,15 @@ def generate_report(report_data, billing_data, month_name,
     # Get pooled (allocated) credits from billing data.
     # As of June 2026, the billing API returns included_ai_credits directly.
     # Only use included/allocated fields to avoid mixing in non-pool metrics.
+    #
+    # IMPORTANT: The Copilot billing API (/enterprises/{e}/copilot/billing) has no
+    # month parameter — it always returns data for the CURRENT billing cycle.
+    # Therefore we only read included_ai_credits from it when the user selected the
+    # current month.  For historical months we skip straight to the computed approach
+    # (current seat count × rate for the selected month) which is the most accurate
+    # value obtainable from the public API for past periods.
     pooled_credits = "N/A"
-    if billing_data:
+    if billing_data and is_current_month:
         ai_credits_nested = billing_data.get("ai_credits") or {}
         if not isinstance(ai_credits_nested, dict):
             ai_credits_nested = {}
@@ -1241,16 +1252,19 @@ def generate_report(report_data, billing_data, month_name,
             parsed = _coerce_number(value)
             if parsed is not None:
                 pooled_credits = int(parsed)
+                print(f"  Pooled credits from billing API (current cycle): {pooled_credits:,}")
                 break
 
-    # Primary fallback: compute from billing API's plan_type + active seat count.
-    # This is the most direct approach and does not require listing individual seats.
+    # Primary computation: derive from billing API's plan_type + active seat count.
+    # For the current month this is used only when the raw field is absent.
+    # For historical months this is the primary (and only) reliable approach because
+    # the billing API's included_ai_credits reflects the current cycle, not history.
     if pooled_credits == "N/A" and billing_data and billing_start_date:
         computed = compute_included_credits_from_billing(billing_data, billing_start_date)
         if computed:
             pooled_credits = computed
 
-    # Secondary fallback: compute from the per-seat plan_type in the seats list.
+    # Secondary computation: derive from per-seat plan_type in the seats list.
     # More precise when seats have mixed plan types, but requires the seats API call.
     if pooled_credits == "N/A" and seats_data and billing_start_date:
         computed = compute_included_credits(seats_data, billing_start_date)
@@ -1431,8 +1445,19 @@ def main():
     year = start_date.year
     month = start_date.month
 
+    # Determine whether the selected month is the current billing cycle.
+    # The Copilot billing API (/enterprises/{e}/copilot/billing) carries no date
+    # parameter and always reflects the CURRENT cycle.  Its ai_credits_used and
+    # included_ai_credits fields must only be used when the user selected the
+    # current month; for any other month those values belong to a different period.
+    today = datetime.now()
+    is_current_month = (start_date.year == today.year and start_date.month == today.month)
+
     print(f"Generating Copilot Usage Report for: {month_name}")
     print(f"Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    if not is_current_month:
+        print("Note: Historical month selected — billing usage API (month-specific) "
+              "will be used as primary source for consumed credits.")
 
     # AI credits billing model is only available from June 2026 onwards.
     if start_date < _AI_CREDITS_MIN_DATE:
@@ -1511,17 +1536,21 @@ def main():
         print(f"  Copilot licensed seats: {seat_user_count} users")
 
     # ── Step 3: Assemble final report_data ────────────────────────────────────
-    # Priority for total credits: billing API > billing usage line items >
-    #   per-user metrics sum > enterprise metrics aggregate
-    # Priority for user count:    per-user metrics > seats > metrics estimate
+    # Priority for consumed credits:
+    #   Current month:   billing API (live counter) > billing usage API >
+    #                    per-user metrics > enterprise metrics aggregate
+    #   Historical month: billing usage API (month-specific, exact) >
+    #                    per-user metrics > enterprise metrics aggregate >
+    #                    billing API as last resort (current-cycle data, may be wrong)
+    # Priority for user count: per-user metrics > seats > metrics estimate
 
     total_credits = 0
     unique_users = 0
     model_breakdown = {}
     cost_center_breakdown = {}
 
-    # Check billing data for ai_credits_used (direct authoritative billing total).
-    # Only use consumed/used fields to avoid mixing in unrelated billing metrics.
+    # Read ai_credits_used from the billing API.
+    # This field is CURRENT-CYCLE ONLY — it is only valid when is_current_month=True.
     billing_used = None
     if billing_data:
         ai_credits_nested = billing_data.get("ai_credits") or {}
@@ -1542,18 +1571,30 @@ def main():
                 billing_used = parsed
                 break
 
-    if billing_used is not None:
+    if is_current_month and billing_used is not None:
+        # Live counter from the billing API — accurate for the current billing cycle.
         total_credits = billing_used
-        print(f"  Using billing API ai_credits_used: {total_credits:,.2f}")
+        print(f"  Using billing API ai_credits_used (current billing cycle): "
+              f"{total_credits:,.2f}")
     elif billing_usage_processed and billing_usage_processed["total_credits"] > 0:
+        # Month-specific billing usage API — always the correct source for
+        # historical months; also a valid cross-check for the current month.
         total_credits = billing_usage_processed["total_credits"]
-        print(f"  Using billing usage total: {total_credits:,.2f}")
+        print(f"  Using billing usage API total (month-specific): {total_credits:,.2f}")
     elif per_user_processed and per_user_processed["total_credits"] > 0:
         total_credits = per_user_processed["total_credits"]
         print(f"  Using per-user metrics for total credits: {total_credits:,.2f}")
     elif metrics_processed and metrics_processed["total_credits"] > 0:
         total_credits = metrics_processed["total_credits"]
         print(f"  Using metrics total: {total_credits:,.2f}")
+    elif not is_current_month and billing_used is not None:
+        # Last resort for historical months: billing API counter.
+        # WARNING: this reflects the CURRENT billing cycle, not the selected month.
+        # It is used only when every month-specific source returned nothing.
+        total_credits = billing_used
+        print(f"  Warning: Using billing API ai_credits_used as last resort for historical "
+              f"month (value reflects current billing cycle, not {month_name}): "
+              f"{total_credits:,.2f}")
 
     # User count: prefer active unique users from per-user metrics; fallback to
     # seat count (licensed users) then aggregate metrics estimate.
@@ -1654,7 +1695,8 @@ def main():
     # Generate the report
     report_text, csv_text = generate_report(
         report_data, billing_data, month_name, seats_data,
-        billing_start_date=start_date
+        billing_start_date=start_date,
+        is_current_month=is_current_month
     )
 
     # Print report to console
