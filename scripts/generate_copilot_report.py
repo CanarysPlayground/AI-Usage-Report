@@ -406,56 +406,46 @@ def fetch_copilot_billing(enterprise, token):
 
 def fetch_enterprise_billing_usage(enterprise, token, year, month):
     """
-    Fetch enterprise billing usage data.
+    Fetch enterprise billing usage line items for a specific month.
 
-    Tries two approaches:
-    1. New reports API: GET /enterprises/{enterprise}/settings/billing/reports
-       Returns download links to CSV/NDJSON files with detailed line items.
-    2. Legacy API: GET /enterprises/{enterprise}/settings/billing/usage
-       Returns JSON with usageItems array.
+    Endpoint: GET /enterprises/{enterprise}/settings/billing/usage
+              ?year=YYYY&month=MM
 
-    Returns the raw response data for processing.
+    Returns a dict with a ``usageItems`` list containing per-day, per-SKU
+    line items (product, sku, quantity, unitType, organizationName, etc.).
+    Handles pagination automatically (GitHub returns up to 100 items/page).
     """
     headers = get_auth_headers(token)
-
-    # Try the new reports API first
-    reports_url = f"https://api.github.com/enterprises/{enterprise}/settings/billing/reports"
-    response = requests.get(reports_url, headers=headers, timeout=30)
-
-    if response.status_code == 200:
-        data = response.json()
-        exports = data.get("usage_report_exports", [])
-        # Find a completed report covering our target month
-        target_start = f"{year}-{month:02d}-01"
-        for export in exports:
-            if (export.get("status") == "completed" and
-                    export.get("start_date", "") <= target_start and
-                    export.get("end_date", "") >= target_start):
-                download_urls = export.get("download_urls", [])
-                if download_urls:
-                    report_data = download_ndjson(download_urls)
-                    if report_data:
-                        return {"usageItems": report_data, "source": "reports_api"}
-        # No matching report found; fall through to legacy API
-
-    # Try legacy billing usage API
     url = f"https://api.github.com/enterprises/{enterprise}/settings/billing/usage"
-    params = {"year": year, "month": month}
 
-    response = requests.get(url, headers=headers, params=params, timeout=30)
+    all_items = []
+    page = 1
 
-    if response.status_code == 200:
-        return response.json()
-    elif response.status_code == 403:
-        print("Note: Billing usage API access forbidden. "
-              "Ensure the token has 'read:enterprise' scope.")
-        return None
-    elif response.status_code == 404:
-        print("Note: Billing usage API not available for this enterprise.")
-        return None
-    else:
-        print(f"Note: Billing usage API returned {response.status_code}")
-        return None
+    while True:
+        params = {"year": year, "month": month, "page": page, "per_page": 100}
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            items = data.get("usageItems", [])
+            all_items.extend(items)
+            # Stop when a page returns fewer than the page size
+            if len(items) < 100:
+                break
+            page += 1
+        elif response.status_code == 403:
+            print("Note: Billing usage API access forbidden. "
+                  "Ensure the token has 'manage_billing:copilot' and "
+                  "'read:enterprise' scopes.")
+            return None
+        elif response.status_code == 404:
+            print("Note: Billing usage API not available for this enterprise.")
+            return None
+        else:
+            print(f"Note: Billing usage API returned {response.status_code}")
+            return None
+
+    return {"usageItems": all_items} if all_items else None
 
 
 def fetch_cost_centers(enterprise, token):
@@ -881,11 +871,13 @@ def process_billing_usage_data(billing_usage, cost_centers):
         # specific AI-credit-related SKU phrases to avoid matching seat/license
         # or other Copilot line items (e.g. "Copilot for Business Seat").
         is_copilot = "copilot" in product or "copilot" in sku
+        # Match only AI-usage SKUs; do NOT fall back on unit_type alone because
+        # that can accidentally include seat/license line items.
         is_ai_usage = any(kw in sku for kw in (
             "premium request", "ai credit", "premium model",
             "add-on premium", "addon premium",
             "copilot credit", "ai request",
-        )) or unit_type in ("credit", "request", "credits", "requests")
+        ))
 
         if not (is_copilot and is_ai_usage):
             continue
@@ -1161,6 +1153,53 @@ def compute_included_credits(seats_data, billing_month_start):
     return total
 
 
+def compute_included_credits_from_billing(billing_data, billing_month_start):
+    """
+    Compute allocated AI credits directly from the Copilot billing API response.
+
+    The ``/enterprises/{enterprise}/copilot/billing`` endpoint returns the
+    enterprise-wide ``plan_type`` and the ``seat_breakdown`` which includes
+    ``active_this_cycle`` — the number of seats that were active during the
+    current billing cycle.  Together these allow us to compute the pooled
+    credit allocation without having to list every individual seat.
+
+    Falls back to the per-plan default rate when the plan_type is not
+    explicitly recognised (e.g. "team", "free", or absent).
+
+    Args:
+        billing_data:         Response dict from the Copilot billing API.
+        billing_month_start:  datetime for the first day of the billing month.
+
+    Returns:
+        int  – total allocated AI credits, or None if the required fields are
+               absent from the billing response.
+    """
+    if not billing_data:
+        return None
+
+    plan = (billing_data.get("plan_type") or "").lower().strip()
+    seat_breakdown = billing_data.get("seat_breakdown") or {}
+    # active_this_cycle is the most accurate count for the current billing period
+    active_seats = (
+        seat_breakdown.get("active_this_cycle") or
+        seat_breakdown.get("total") or
+        0
+    )
+    active_seats = int(active_seats)
+    if active_seats == 0 or not plan:
+        return None
+
+    is_promo = _AI_CREDITS_PROMO_START <= billing_month_start < _AI_CREDITS_PROMO_END
+    rates = _AI_CREDITS_PER_SEAT_PROMO if is_promo else _AI_CREDITS_PER_SEAT
+    rate = rates.get(plan, _AI_CREDITS_PER_SEAT_DEFAULT)
+
+    total = active_seats * rate
+    period_label = "promotional" if is_promo else "standard"
+    print(f"  Allocated credits: {active_seats} active seat(s) × "
+          f"{rate:,} ({plan}, {period_label}) = {total:,}")
+    return total
+
+
 def generate_report(report_data, billing_data, month_name,
                     seats_data=None, billing_start_date=None):
     """
@@ -1204,10 +1243,15 @@ def generate_report(report_data, billing_data, month_name,
                 pooled_credits = int(parsed)
                 break
 
-    # If the billing API didn't return a pool size, compute it from the seats
-    # list using the per-plan-type credit rates from the GitHub docs.
-    # Rates differ between Copilot Business and Copilot Enterprise, and a
-    # promotional 3x-to-4x boost applies June 1 – September 1, 2026.
+    # Primary fallback: compute from billing API's plan_type + active seat count.
+    # This is the most direct approach and does not require listing individual seats.
+    if pooled_credits == "N/A" and billing_data and billing_start_date:
+        computed = compute_included_credits_from_billing(billing_data, billing_start_date)
+        if computed:
+            pooled_credits = computed
+
+    # Secondary fallback: compute from the per-seat plan_type in the seats list.
+    # More precise when seats have mixed plan types, but requires the seats API call.
     if pooled_credits == "N/A" and seats_data and billing_start_date:
         computed = compute_included_credits(seats_data, billing_start_date)
         if computed:
@@ -1216,12 +1260,11 @@ def generate_report(report_data, billing_data, month_name,
                         < _AI_CREDITS_PROMO_END)
             period_label = "promotional" if is_promo else "standard"
             print(f"Note: Pooled credits computed from {len(seats_data)} seat(s) "
-                  f"using {period_label} per-plan rates → {pooled_credits:,}")
+                  f"using per-seat plan_type ({period_label} rates) → {pooled_credits:,}")
 
     if pooled_credits == "N/A" and billing_data:
         print("Warning: Could not determine pooled (allocated) AI credits. "
-              "The billing API did not return an included_ai_credits field and "
-              "no seats data was available to compute the pool.")
+              "The billing API did not return plan_type / seat_breakdown data.")
 
     report_lines = []
     report_lines.append(f"GitHub Copilot USAGE SUMMARY REPORT - {month_name.upper()}")
