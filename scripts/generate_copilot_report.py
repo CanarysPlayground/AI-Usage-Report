@@ -1263,6 +1263,11 @@ def generate_report(report_data, billing_data, month_name,
         computed = compute_included_credits_from_billing(billing_data, billing_start_date)
         if computed:
             pooled_credits = computed
+            # compute_included_credits_from_billing already prints a breakdown line;
+            # add a context tag so it's clear this is for the selected month.
+            month_label = "current month" if is_current_month else "selected month"
+            print(f"  Pooled credits computed from billing API seat data "
+                  f"(for {month_label}): {pooled_credits:,}")
 
     # Secondary computation: derive from per-seat plan_type in the seats list.
     # More precise when seats have mixed plan types, but requires the seats API call.
@@ -1273,8 +1278,10 @@ def generate_report(report_data, billing_data, month_name,
             is_promo = (_AI_CREDITS_PROMO_START <= billing_start_date
                         < _AI_CREDITS_PROMO_END)
             period_label = "promotional" if is_promo else "standard"
+            month_label = "current month" if is_current_month else "selected month"
             print(f"Note: Pooled credits computed from {len(seats_data)} seat(s) "
-                  f"using per-seat plan_type ({period_label} rates) → {pooled_credits:,}")
+                  f"using per-seat plan_type ({period_label} rates, {month_label}) "
+                  f"→ {pooled_credits:,}")
 
     if pooled_credits == "N/A" and billing_data:
         print("Warning: Could not determine pooled (allocated) AI credits. "
