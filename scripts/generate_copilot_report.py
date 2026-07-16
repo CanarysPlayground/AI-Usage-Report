@@ -1810,10 +1810,10 @@ def main():
               f"and do not include today's usage.")
     elif per_user_processed and per_user_processed["total_credits"] > 0:
         total_credits = per_user_processed["total_credits"]
-        print(f"  Using per-user metrics for total credits: {total_credits:,.2f}")
+        print("  Using per-user metrics for total credits.")
     elif metrics_processed and metrics_processed["total_credits"] > 0:
         total_credits = metrics_processed["total_credits"]
-        print(f"  Using metrics total: {total_credits:,.2f}")
+        print("  Using metrics total for total credits.")
     elif not is_current_month and billing_used is not None:
         # Last resort for historical months: billing API counter.
         # WARNING: this reflects the CURRENT billing cycle, not the selected month.
