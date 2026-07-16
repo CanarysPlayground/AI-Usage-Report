@@ -1956,7 +1956,11 @@ def main():
     print("Fetching enterprise billing usage (AI credits)...")
     billing_usage = fetch_enterprise_billing_usage(enterprise, token, year, month)
 
-    # 1g. Cost centers list → maps cost-center IDs/names to org resources
+    # 1g. Billing usage summary (aggregated, more efficient for large enterprises)
+    print("Fetching billing usage summary...")
+    billing_usage_summary = fetch_billing_usage_summary(enterprise, token, year, month)
+
+    # 1h. Cost centers list → maps cost-center IDs/names to org resources
     print("Fetching cost centers...")
     cost_centers = fetch_cost_centers(enterprise, token)
 
@@ -1981,6 +1985,20 @@ def main():
 
     # Process billing usage (cost-center labels, included/additional breakdown)
     billing_usage_processed = process_billing_usage_data(billing_usage, cost_centers)
+
+    # Process billing usage summary (aggregated cost-center breakdown)
+    usage_summary_processed = None
+    if billing_usage_summary:
+        print("Processing billing usage summary data...")
+        usage_summary_processed = process_usage_summary_data(billing_usage_summary)
+        if usage_summary_processed:
+            print(f"  Usage summary: {usage_summary_processed['total_credits']:,.2f} AI credits, "
+                  f"{len(usage_summary_processed['cost_center_breakdown'])} cost centers")
+
+    # Build user → cost center mapping from cost centers and seats data
+    user_cost_center_map = build_user_cost_center_map(cost_centers, seats_data)
+    if user_cost_center_map:
+        print(f"  User-to-cost-center mapping: {len(user_cost_center_map)} users mapped")
 
     # Get seat count — this is the authoritative count of Copilot licensed users.
     # Deduplicate by user login to avoid double-counting users granted access
@@ -2028,6 +2046,10 @@ def main():
         print(f"  Consumed credits from per-user metrics (sum of ai_credits_used): "
               f"{total_credits:,.2f}")
 
+    if total_credits == 0 and usage_summary_processed and usage_summary_processed["total_credits"] > 0:
+        total_credits = usage_summary_processed["total_credits"]
+        print(f"  Consumed credits from billing usage-summary API: {total_credits:,.2f}")
+
     if total_credits == 0:
         print("  Warning: Could not determine consumed AI credits.")
         print("  Ensure the token has 'manage_billing:copilot' scope and that there "
@@ -2058,11 +2080,25 @@ def main():
         if _has_named_models(billing_models):
             model_breakdown = billing_models
 
-    # Cost center breakdown: prefer per-user org data > billing usage > org metrics.
-    # Billing usage cost-center labels may be present but the credit quantities in
-    # that source are unreliable (token-level, not AI-credit-level), so we use the
-    # per-user org data as the primary cost-center credit source.
-    if per_user_processed and per_user_processed.get("org_breakdown"):
+    # Cost center breakdown priority:
+    #   1. Usage summary API (aggregated, most efficient, has proper cost center names)
+    #   2. Per-user data re-attributed via user_cost_center_map (accurate credits)
+    #   3. Per-user org breakdown (fallback when no cost center mapping available)
+    #   4. Billing usage line items (cost-center labels present but credit values unreliable)
+    #   5. Org metrics (last resort)
+    if usage_summary_processed and usage_summary_processed.get("cost_center_breakdown"):
+        cost_center_breakdown = usage_summary_processed["cost_center_breakdown"]
+        print("  Cost center breakdown from billing usage-summary API.")
+    elif user_cost_center_map and per_user_processed and per_user_processed.get("user_credits"):
+        # Re-attribute per-user credits to cost centers using the cost center map
+        print("  Building cost-center breakdown from per-user credits + cost center map...")
+        cc_breakdown = defaultdict(lambda: {"credits": 0.0, "users": set()})
+        for login, credits in per_user_processed["user_credits"].items():
+            cc_name = user_cost_center_map.get(login, "Not Assigned")
+            cc_breakdown[cc_name]["credits"] += credits
+            cc_breakdown[cc_name]["users"].add(login)
+        cost_center_breakdown = dict(cc_breakdown)
+    elif per_user_processed and per_user_processed.get("org_breakdown"):
         cost_center_breakdown = per_user_processed["org_breakdown"]
     elif billing_usage_processed and billing_usage_processed.get("cost_center_breakdown"):
         cost_center_breakdown = billing_usage_processed["cost_center_breakdown"]
