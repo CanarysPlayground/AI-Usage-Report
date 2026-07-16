@@ -2092,11 +2092,13 @@ def main():
     elif user_cost_center_map and per_user_processed and per_user_processed.get("user_credits"):
         # Re-attribute per-user credits to cost centers using the cost center map
         print("  Building cost-center breakdown from per-user credits + cost center map...")
-        cc_breakdown = defaultdict(lambda: {"credits": 0.0, "users": set()})
+        cc_breakdown = defaultdict(lambda: {"credits": 0.0, "users": set(), "user_count": 0})
         for login, credits in per_user_processed["user_credits"].items():
             cc_name = user_cost_center_map.get(login, "Not Assigned")
             cc_breakdown[cc_name]["credits"] += credits
             cc_breakdown[cc_name]["users"].add(login)
+        for cc_data in cc_breakdown.values():
+            cc_data["user_count"] = len(cc_data["users"])
         cost_center_breakdown = dict(cc_breakdown)
     elif per_user_processed and per_user_processed.get("org_breakdown"):
         cost_center_breakdown = per_user_processed["org_breakdown"]
