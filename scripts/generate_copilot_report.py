@@ -517,6 +517,10 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
             if 'rel="next"' not in link_header:
                 break
 
+            # Guard: an empty page means there is no more data.
+            if len(items) == 0:
+                break
+
             # Fallback: if no Link header, use observed page size to detect
             # the last page.  observed_page_size is fixed on the first page so
             # a short final page correctly triggers the break even when the
@@ -539,6 +543,9 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
             print(f"Note: Billing usage API returned {response.status_code}")
             return None
 
+    # page exceeds MAX_BILLING_PAGES only when the last full page was fetched
+    # and then page was incremented past the cap — i.e. the loop exited via the
+    # while condition rather than a break, meaning more pages still exist.
     if page > MAX_BILLING_PAGES:
         print("Warning: Billing usage API page limit reached. "
               "For large enterprises the dataset may be incomplete; "
