@@ -1793,6 +1793,12 @@ def main():
         total_credits = billing_used
         print(f"  Using billing API ai_credits_used (current billing cycle): "
               f"{total_credits:,.2f}")
+    elif is_current_month and billing_usage_processed and billing_usage_processed["total_credits"] > 0:
+        # Month-specific billing usage API provides current month-to-date totals
+        # and is more accurate than per-user NDJSON (which can lag by ~1 day).
+        total_credits = billing_usage_processed["total_credits"]
+        print(f"  Using billing usage API total (current month-to-date): "
+              f"{total_credits:,.2f}")
     elif is_current_month and per_user_processed and per_user_processed["total_credits"] > 0:
         # Per-user NDJSON reports are generated daily with ~1-day lag; for the
         # current month this covers all completed days but not today.
@@ -1822,12 +1828,12 @@ def main():
               f"month (value reflects current billing cycle, not {month_name}): "
               f"{total_credits:,.2f}")
 
-    # User count: prefer active unique users from per-user metrics; fallback to
-    # deduplicated seat count (licensed users) then aggregate metrics estimate.
-    if per_user_processed and per_user_processed["unique_users"] > 0:
-        unique_users = per_user_processed["unique_users"]
-    elif seat_user_count > 0:
+    # User count: use deduplicated licensed seats as the authoritative value.
+    # Fallback to active users from metrics only when seats cannot be fetched.
+    if seat_user_count > 0:
         unique_users = seat_user_count
+    elif per_user_processed and per_user_processed["unique_users"] > 0:
+        unique_users = per_user_processed["unique_users"]
     elif metrics_processed:
         unique_users = metrics_processed["unique_users"]
 
