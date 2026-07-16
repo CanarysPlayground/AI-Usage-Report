@@ -490,9 +490,11 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
     all_items = []
     per_page = 100
     page = 1
-    # Tracks the actual number of items the API returns per page, which may
-    # differ from per_page if the server ignores the per_page parameter.
-    actual_page_size = per_page
+    # Records the actual items-per-page the API delivers on its first response.
+    # The server may ignore per_page and return a larger fixed chunk (e.g. 2729
+    # items instead of 100).  We capture it once so the fallback break
+    # condition can compare against the correct observed page size.
+    observed_page_size = None
 
     while page <= MAX_BILLING_PAGES:
         params = {"year": year, "month": month, "page": page, "per_page": per_page}
@@ -515,12 +517,13 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
             if 'rel="next"' not in link_header:
                 break
 
-            # Fallback: fewer items than the expected page size → last page.
-            # Track actual_page_size because the API may ignore per_page and
-            # return a larger fixed chunk (e.g. 2729 items instead of 100).
-            if len(items) > actual_page_size:
-                actual_page_size = len(items)
-            if len(items) < actual_page_size:
+            # Fallback: if no Link header, use observed page size to detect
+            # the last page.  observed_page_size is fixed on the first page so
+            # a short final page correctly triggers the break even when the
+            # server ignores the per_page parameter.
+            if observed_page_size is None:
+                observed_page_size = len(items)
+            if len(items) < observed_page_size:
                 break
 
             page += 1
@@ -537,8 +540,7 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
             return None
 
     if page > MAX_BILLING_PAGES:
-        print(f"Warning: Billing usage API page limit ({MAX_BILLING_PAGES}) reached "
-              f"({len(all_items):,} items collected). "
+        print(f"Warning: Billing usage API page limit ({MAX_BILLING_PAGES}) reached. "
               "For large enterprises the dataset may be incomplete; "
               "AI-credit totals will fall back to Copilot-specific API sources.")
 
