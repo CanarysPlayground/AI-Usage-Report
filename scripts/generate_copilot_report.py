@@ -1805,7 +1805,7 @@ def main():
         # current month this covers all completed days but not today.
         # Log a warning since this is a known accuracy limitation.
         total_credits = per_user_processed["total_credits"]
-        print(f"  Warning: Billing API did not return ai_credits_used for the current "
+        print(f"  Warning: Live billing counter (ai_credits_used) was unavailable for the current "
               f"month. Falling back to per-user NDJSON reports, which lag by ~1 day "
               f"and do not include today's usage.")
     elif per_user_processed and per_user_processed["total_credits"] > 0:
@@ -1824,7 +1824,8 @@ def main():
               f"{total_credits:,.2f}")
 
     # User count: use deduplicated licensed seats as the authoritative value.
-    # Fallback to active users from metrics only when seats cannot be fetched.
+    # Fallback order when seats are unavailable: per-user active users, then
+    # aggregate metrics estimate.
     if seat_user_count > 0:
         unique_users = seat_user_count
     elif per_user_processed and per_user_processed["unique_users"] > 0:
