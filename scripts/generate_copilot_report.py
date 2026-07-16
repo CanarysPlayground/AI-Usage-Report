@@ -540,7 +540,7 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
             return None
 
     if page > MAX_BILLING_PAGES:
-        print(f"Warning: Billing usage API page limit ({MAX_BILLING_PAGES}) reached. "
+        print("Warning: Billing usage API page limit reached. "
               "For large enterprises the dataset may be incomplete; "
               "AI-credit totals will fall back to Copilot-specific API sources.")
 
