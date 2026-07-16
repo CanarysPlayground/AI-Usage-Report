@@ -560,18 +560,214 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
     return {"usageItems": all_items} if all_items else None
 
 
+def fetch_billing_usage_summary(enterprise, token, year, month):
+    """
+    Fetch enterprise billing usage summary for Copilot, grouped by cost center.
+
+    Endpoint: GET /enterprises/{enterprise}/settings/billing/usage-summary
+              ?product=copilot&group_by=cost_center&year=YYYY&month=MM
+
+    This endpoint returns aggregated usage data rather than raw line items,
+    making it much more efficient than the /settings/billing/usage endpoint
+    for large enterprises.  It provides:
+      - Total AI credits consumed for the product
+      - Per-cost-center breakdown with credits and user counts
+
+    Returns a dict with the parsed response, or None on failure.
+    """
+    headers = get_auth_headers(token)
+    url = f"https://api.github.com/enterprises/{enterprise}/settings/billing/usage-summary"
+    params = {
+        "product": "copilot",
+        "group_by": "cost_center",
+        "year": year,
+        "month": month,
+    }
+
+    try:
+        response = _get_with_retry(url, headers, params=params)
+    except requests.exceptions.RequestException as exc:
+        print(f"Warning: Billing usage-summary API request failed: {exc}")
+        return None
+
+    if response.status_code == 200:
+        data = response.json()
+        print(f"  Billing usage-summary API responded successfully.")
+        if isinstance(data, dict):
+            print(f"  Usage-summary response keys: {list(data.keys())}")
+        return data
+    elif response.status_code in (403, 404):
+        print(f"Note: Billing usage-summary API returned {response.status_code}. "
+              f"Will fall back to raw billing usage API.")
+        return None
+    else:
+        print(f"Warning: Billing usage-summary API returned {response.status_code}")
+        return None
+
+
+def process_usage_summary_data(usage_summary):
+    """
+    Process the usage-summary API response to extract:
+    - Total AI credits consumed
+    - Per-cost-center breakdown (credits + user count)
+
+    The response format may contain:
+    - total_usage.total_credits_used: overall credits consumed
+    - groups[]: array of cost-center-wise breakdowns
+
+    Handles multiple possible response formats from the API.
+    """
+    if not usage_summary:
+        return None
+
+    total_credits = 0.0
+    cost_center_breakdown = defaultdict(lambda: {"credits": 0.0, "users": set(), "user_count": 0})
+
+    # Extract total credits from various possible response structures
+    total_usage = usage_summary.get("total_usage") or {}
+    if isinstance(total_usage, dict):
+        total_credits = float(total_usage.get("total_credits_used", 0) or
+                              total_usage.get("total_credits", 0) or
+                              total_usage.get("credits_used", 0) or 0)
+
+    # Try top-level total fields if total_usage didn't have it
+    if total_credits == 0:
+        for key in ("total_credits_used", "total_credits", "totalCreditsUsed",
+                    "total_ai_credits_used", "credits_used"):
+            val = _coerce_number(usage_summary.get(key))
+            if val is not None and val > 0:
+                total_credits = val
+                break
+
+    # Extract cost center groups
+    groups = (usage_summary.get("groups") or
+              usage_summary.get("cost_centers") or
+              usage_summary.get("usageByGroup") or
+              usage_summary.get("usage_by_cost_center") or [])
+
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+
+            # Cost center name from various possible field names
+            cc_name = (group.get("cost_center") or
+                       group.get("costCenterName") or
+                       group.get("cost_center_name") or
+                       group.get("name") or
+                       "Not Assigned")
+
+            # Credits consumed by this cost center
+            cc_credits = float(
+                group.get("total_credits_used", 0) or
+                group.get("credits_used", 0) or
+                group.get("totalCreditsUsed", 0) or
+                group.get("quantity", 0) or 0
+            )
+
+            # User count or user list
+            users_list = group.get("users", [])
+            user_count = 0
+            user_set = set()
+
+            if isinstance(users_list, list):
+                for u in users_list:
+                    if isinstance(u, dict):
+                        login = u.get("user_login") or u.get("login") or ""
+                        if login:
+                            user_set.add(login)
+                    elif isinstance(u, str):
+                        user_set.add(u)
+                user_count = len(user_set) if user_set else len(users_list)
+            elif isinstance(users_list, int):
+                user_count = users_list
+
+            # Also check for explicit user_count / users_count fields
+            if user_count == 0:
+                user_count = int(group.get("user_count", 0) or
+                                 group.get("users_count", 0) or
+                                 group.get("total_users", 0) or 0)
+
+            cost_center_breakdown[cc_name]["credits"] += cc_credits
+            cost_center_breakdown[cc_name]["users"].update(user_set)
+            if user_count > 0:
+                cost_center_breakdown[cc_name]["user_count"] = max(
+                    cost_center_breakdown[cc_name]["user_count"], user_count
+                )
+
+            # Accumulate total if not already set from top-level
+            if total_credits == 0:
+                total_credits += cc_credits
+
+    # If total wasn't in the response, sum from groups
+    if total_credits == 0 and cost_center_breakdown:
+        total_credits = sum(d["credits"] for d in cost_center_breakdown.values())
+
+    if total_credits == 0 and not cost_center_breakdown:
+        return None
+
+    return {
+        "total_credits": total_credits,
+        "cost_center_breakdown": dict(cost_center_breakdown),
+    }
+
+
+def build_user_cost_center_map(cost_centers, seats_data):
+    """
+    Build a mapping of user login → cost center name using the cost centers
+    API resources and the Copilot seats data.
+
+    Cost centers can contain resources of type 'user', 'organization', or 'team'.
+    For org/team resources, all seats assigned through that org are attributed
+    to the cost center.
+
+    Returns a dict: {user_login: cost_center_name}
+    """
+    user_cc_map = {}
+    if not cost_centers:
+        return user_cc_map
+
+    # Build org → cost center map and direct user → cost center map
+    org_cc_map = {}
+    for center in cost_centers:
+        cc_name = center.get("name") or center.get("displayName", "Unknown")
+        resources = center.get("resources", [])
+        for resource in resources:
+            res_type = (resource.get("type") or "").lower()
+            res_name = resource.get("name") or resource.get("login") or ""
+            if res_type == "user" and res_name:
+                user_cc_map[res_name] = cc_name
+            elif res_type == "organization" and res_name:
+                org_cc_map[res_name] = cc_name
+
+    # Map seats to cost centers via their organization
+    if seats_data and org_cc_map:
+        for seat in seats_data:
+            assignee = seat.get("assignee") or {}
+            login = (assignee.get("login", "")
+                     if isinstance(assignee, dict) else "")
+            if not login or login in user_cc_map:
+                continue
+            org = (seat.get("organization", {}).get("login", "")
+                   if isinstance(seat.get("organization"), dict) else
+                   seat.get("organization", ""))
+            if org and org in org_cc_map:
+                user_cc_map[login] = org_cc_map[org]
+
+    return user_cc_map
+
+
 def fetch_cost_centers(enterprise, token):
     """
     Fetch the list of cost centers for the enterprise.
-    Endpoint: GET /enterprises/{enterprise}/cost-centers
+    Endpoint: GET /enterprises/{enterprise}/settings/billing/cost-centers
 
-    Each cost center includes a 'resources' list that maps organizations or
-    teams to the cost center.  This is used to look up which org belongs to
-    which cost center when the billing-usage line items do not carry a direct
-    cost-center label.
+    Each cost center includes a 'resources' list that maps organizations,
+    teams, or users to the cost center.  This is used to look up which org
+    or user belongs to which cost center.
     """
     headers = get_auth_headers(token)
-    url = f"https://api.github.com/enterprises/{enterprise}/cost-centers"
+    url = f"https://api.github.com/enterprises/{enterprise}/settings/billing/cost-centers"
     all_centers = []
     page = 1
 
