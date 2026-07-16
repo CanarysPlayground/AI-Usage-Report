@@ -1736,100 +1736,31 @@ def main():
               f"({len(seats_data)} total seat entries)")
 
     # ── Step 3: Assemble final report_data ────────────────────────────────────
-    # Priority for consumed credits:
-    #   Current month:   billing API (live counter) > per-user metrics >
-    #                    billing usage API > enterprise metrics aggregate
-    #   Historical month: billing usage API (month-specific, exact) >
-    #                    per-user metrics > enterprise metrics aggregate >
-    #                    billing API as last resort (current-cycle data, may be wrong)
-    # Priority for user count: per-user metrics > seats (deduplicated) >
-    #                          metrics estimate
+    # Consumed credits: enterprise billing usage API is the single source.
+    # It accepts year + month parameters so it returns the correct data for
+    # both the current month (month-to-date) and any historical month.
 
     total_credits = 0
     unique_users = 0
     model_breakdown = {}
     cost_center_breakdown = {}
 
-    # Read ai_credits_used from the billing API.
-    # This field is CURRENT-CYCLE ONLY — it is only valid when is_current_month=True.
-    # The exact field name depends on the API version; we try all known variants.
-    billing_used = None
-    if billing_data:
-        ai_credits_nested = billing_data.get("ai_credits") or {}
-        if not isinstance(ai_credits_nested, dict):
-            ai_credits_nested = {}
-        used_candidates = (
-            billing_data.get("ai_credits_used"),
-            billing_data.get("ai_credits_used_this_billing_cycle"),
-            billing_data.get("ai_credits_used_this_cycle"),
-            billing_data.get("total_ai_credits_used"),
-            billing_data.get("copilot_ai_credits_used"),
-            billing_data.get("ai_credits_consumed"),
-            billing_data.get("total_ai_credits_consumed"),
-            billing_data.get("credits_used"),
-            ai_credits_nested.get("used"),
-            ai_credits_nested.get("used_this_cycle"),
-            ai_credits_nested.get("used_this_billing_cycle"),
-            ai_credits_nested.get("consumed"),
-            ai_credits_nested.get("consumed_this_cycle"),
-            ai_credits_nested.get("total_used"),
-            ai_credits_nested.get("usage"),
-            ai_credits_nested.get("credits_used"),
-            ai_credits_nested.get("current_usage"),
-            ai_credits_nested.get("monthly_usage"),
-        )
-        for value in used_candidates:
-            parsed = _coerce_number(value)
-            if parsed is not None:
-                billing_used = parsed
-                break
-
-    if billing_used is None and billing_data:
-        print("  Note: Billing API response did not contain a recognised "
-              "ai_credits_used field (consumed credits).")
-
-    if is_current_month and billing_used is not None:
-        # Live counter from the billing API — most up-to-date for the current cycle.
-        total_credits = billing_used
-        print(f"  Using billing API ai_credits_used (current billing cycle): "
-              f"{total_credits:,.2f}")
-    elif is_current_month and per_user_processed and per_user_processed["total_credits"] > 0:
-        # Per-user NDJSON reports are generated daily with ~1-day lag; for the
-        # current month this covers all completed days but not today.
-        # Log a warning since this is a known accuracy limitation.
-        total_credits = per_user_processed["total_credits"]
-        print(f"  Warning: Billing API did not return ai_credits_used for the current "
-              f"month. Falling back to per-user NDJSON reports, which lag by ~1 day "
-              f"and do not include today's usage. "
-              f"Total (may be understated): {total_credits:,.2f}")
-    elif billing_usage_processed and billing_usage_processed["total_credits"] > 0:
-        # Month-specific billing usage API — always the correct source for
-        # historical months; also a valid cross-check for the current month.
+    # Consumed credits — billing usage API only (month-specific).
+    if billing_usage_processed and billing_usage_processed["total_credits"] > 0:
         total_credits = billing_usage_processed["total_credits"]
-        print(f"  Using billing usage API total (month-specific): {total_credits:,.2f}")
-    elif per_user_processed and per_user_processed["total_credits"] > 0:
-        total_credits = per_user_processed["total_credits"]
-        print(f"  Using per-user metrics for total credits: {total_credits:,.2f}")
-    elif metrics_processed and metrics_processed["total_credits"] > 0:
-        total_credits = metrics_processed["total_credits"]
-        print(f"  Using metrics total: {total_credits:,.2f}")
-    elif not is_current_month and billing_used is not None:
-        # Last resort for historical months: billing API counter.
-        # WARNING: this reflects the CURRENT billing cycle, not the selected month.
-        # It is used only when every month-specific source returned nothing.
-        total_credits = billing_used
-        print(f"  Warning: Using billing API ai_credits_used as last resort for historical "
-              f"month (value reflects current billing cycle, not {month_name}): "
-              f"{total_credits:,.2f}")
+        print("  Consumed credits sourced from billing usage API.")
+    else:
+        print("  Warning: Billing usage API returned no AI credit data for this month.")
+        print("  Ensure the token has 'manage_billing:copilot' and 'read:enterprise' "
+              "scopes and that there is Copilot usage for the selected month.")
 
-    # User count: prefer active unique users from per-user metrics; fallback to
-    # deduplicated seat count (licensed users) then aggregate metrics estimate.
-    if per_user_processed and per_user_processed["unique_users"] > 0:
-        unique_users = per_user_processed["unique_users"]
-    elif seat_user_count > 0:
+    # User count: licensed seats are the authoritative value.
+    # Only fall back to per-user active users when the seats API is unavailable.
+    if seat_user_count > 0:
         unique_users = seat_user_count
-    elif metrics_processed:
-        unique_users = metrics_processed["unique_users"]
+    elif per_user_processed and per_user_processed["unique_users"] > 0:
+        unique_users = per_user_processed["unique_users"]
+        print("  Note: Using active user count from per-user metrics (seats API unavailable).")
 
     # Model breakdown: prefer billing usage only when model names are present;
     # otherwise use metrics (which usually carries detailed model names).
@@ -1864,51 +1795,6 @@ def main():
         )
         if cc_breakdown:
             cost_center_breakdown = cc_breakdown
-
-    # ── Legacy fallback if all new sources returned nothing ────────────────
-    if total_credits == 0:
-        print("Primary APIs returned no data. Trying legacy APIs...")
-        print("Fetching Copilot usage data (legacy)...")
-        usage_data = fetch_copilot_usage(enterprise, token, start_date, end_date)
-
-        print("Fetching metrics data (legacy)...")
-        metrics_data = fetch_copilot_metrics(enterprise, token, start_date, end_date)
-
-        if usage_data:
-            legacy_result = process_usage_data(usage_data)
-            total_credits = legacy_result["total_credits"]
-            if unique_users == 0:
-                unique_users = legacy_result["unique_users"]
-            if not model_breakdown:
-                model_breakdown = legacy_result["model_breakdown"]
-            if not cost_center_breakdown:
-                cost_center_breakdown = legacy_result["cost_center_breakdown"]
-
-        if metrics_data:
-            legacy_metrics = process_metrics_data(metrics_data)
-            if legacy_metrics["model_breakdown"] and not model_breakdown:
-                model_breakdown = legacy_metrics["model_breakdown"]
-            if legacy_metrics["total_credits"] > total_credits:
-                total_credits = legacy_metrics["total_credits"]
-
-        # Build cost-center breakdown from org metrics even in legacy path
-        if cost_centers and not cost_center_breakdown:
-            print("Building cost-center breakdown from org metrics (legacy path)...")
-            cc_breakdown = build_cost_center_metrics(
-                cost_centers, token, start_date, end_date
-            )
-            if cc_breakdown:
-                cost_center_breakdown = cc_breakdown
-
-    if total_credits == 0:
-        print("\nWarning: No Copilot usage data could be retrieved from any API source.")
-        print("Please verify:")
-        print("  - ENTERPRISE_SLUG is correct")
-        print("  - GH_TOKEN has 'manage_billing:copilot' and 'read:enterprise' scopes")
-        print("  - The selected month has Copilot usage data")
-        if start_date < _AI_CREDITS_MIN_DATE:
-            print(f"  - AI credits are only available from "
-                  f"{_AI_CREDITS_MIN_DATE.strftime('%B %Y')} onwards")
 
     report_data = {
         "total_credits": total_credits,
