@@ -16,10 +16,14 @@ import sys
 import json
 import csv
 import io
+import time
 from datetime import datetime, timedelta
 from collections import defaultdict
 
 import requests
+
+# Ensure all print() output is immediately flushed to the log
+sys.stdout.reconfigure(line_buffering=True)
 
 
 def extract_download_links(api_data):
@@ -119,6 +123,30 @@ def get_auth_headers(token):
         "Authorization": "Bearer " + token,
         "X-GitHub-Api-Version": "2022-11-28"
     }
+
+
+def _get_with_retry(url, headers, params=None, timeout=(10, 30), max_retries=3):
+    """
+    Perform a GET request with exponential-backoff retry on transient errors.
+
+    Uses a (connect_timeout, read_timeout) tuple so a stalled connection is
+    detected quickly while still allowing the server up to 30 s to respond.
+
+    Returns the response object on success, or raises the last exception if
+    all retries are exhausted.
+    """
+    delay = 5  # seconds before first retry
+    for attempt in range(1, max_retries + 1):
+        try:
+            return requests.get(url, headers=headers, params=params, timeout=timeout)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as exc:
+            if attempt == max_retries:
+                raise
+            print(f"Warning: Request failed (attempt {attempt}/{max_retries}): {exc}. "
+                  f"Retrying in {delay}s...")
+            time.sleep(delay)
+            delay *= 2  # exponential backoff
 
 
 # ---------------------------------------------------------------------------
@@ -430,12 +458,20 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
 
     while True:
         params = {"year": year, "month": month, "page": page, "per_page": 100}
-        response = requests.get(url, headers=headers, params=params, timeout=30)
+        try:
+            response = _get_with_retry(url, headers, params=params)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as exc:
+            print(f"Warning: Billing usage API connection failed after retries: {exc}. "
+                  f"Returning {len(all_items)} items collected so far.")
+            break
 
         if response.status_code == 200:
             data = response.json()
             items = data.get("usageItems", [])
             all_items.extend(items)
+            print(f"  Billing usage page {page}: {len(items)} items "
+                  f"(total so far: {len(all_items)})")
             # Stop when a page returns fewer than the page size
             if len(items) < 100:
                 break
