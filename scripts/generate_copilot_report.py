@@ -209,6 +209,11 @@ def fetch_copilot_metrics_report(enterprise, token, start_date, end_date):
             return None
         elif response.status_code in (204, 422):
             pass  # No data for this day
+        elif response.status_code in (401, 403):
+            # Access denied — no point retrying for each remaining day.
+            print(f"Warning: Metrics report API returned {response.status_code} "
+                  f"(access denied). Stopping day-by-day iteration.")
+            return None
         else:
             print(f"Warning: Metrics report API returned {response.status_code} "
                   f"for {day_str}")
@@ -255,6 +260,11 @@ def fetch_copilot_user_metrics(enterprise, token, start_date, end_date):
             return None
         elif response.status_code in (204, 422):
             pass  # No data for this day
+        elif response.status_code in (401, 403):
+            # Access denied — no point retrying for each remaining day.
+            print(f"Warning: User metrics report API returned {response.status_code} "
+                  f"(access denied). Stopping day-by-day iteration.")
+            return None
         else:
             print(f"Warning: User metrics report API returned "
                   f"{response.status_code} for {day_str}")
@@ -461,16 +471,33 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
 
     Returns a dict with a ``usageItems`` list containing per-day, per-SKU
     line items (product, sku, quantity, unitType, organizationName, etc.).
-    Handles pagination automatically (GitHub returns up to 100 items/page).
+    Handles pagination via the HTTP Link header (GitHub standard) with a
+    MAX_BILLING_PAGES safety cap to prevent infinite loops on large enterprises.
+
+    Note: For very large enterprises the billing usage dataset can contain
+    millions of records (one per product/SKU/org/day).  When the cap is
+    reached, Copilot AI-credit totals are sourced from the Copilot-specific
+    APIs (copilot/billing, per-user metrics) instead.
     """
+    # Safety cap: stop after this many pages regardless of Link header.
+    # At ~1.5 s/page this limits the billing-usage fetch to ≈5 minutes,
+    # leaving the rest of the workflow time budget for other steps.
+    MAX_BILLING_PAGES = 200
+
     headers = get_auth_headers(token)
     url = f"https://api.github.com/enterprises/{enterprise}/settings/billing/usage"
 
     all_items = []
+    per_page = 100
     page = 1
+    # Records the actual items-per-page the API delivers on its first response.
+    # The server may ignore per_page and return a larger fixed chunk (e.g. 2729
+    # items instead of 100).  We capture it once so the fallback break
+    # condition can compare against the correct observed page size.
+    observed_page_size = None
 
-    while True:
-        params = {"year": year, "month": month, "page": page, "per_page": 100}
+    while page <= MAX_BILLING_PAGES:
+        params = {"year": year, "month": month, "page": page, "per_page": per_page}
         try:
             response = _get_with_retry(url, headers, params=params)
         except requests.exceptions.RequestException as exc:
@@ -484,9 +511,25 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
             all_items.extend(items)
             print(f"  Billing usage page {page}: {len(items)} items "
                   f"(total so far: {len(all_items)})")
-            # Stop when a page returns fewer than the page size
-            if len(items) < 100:
+
+            # Primary termination: GitHub Link header signals the last page.
+            link_header = response.headers.get("Link", "")
+            if 'rel="next"' not in link_header:
                 break
+
+            # Guard: an empty page means there is no more data.
+            if len(items) == 0:
+                break
+
+            # Fallback: if no Link header, use observed page size to detect
+            # the last page.  observed_page_size is fixed on the first page so
+            # a short final page correctly triggers the break even when the
+            # server ignores the per_page parameter.
+            if observed_page_size is None:
+                observed_page_size = len(items)
+            if len(items) < observed_page_size:
+                break
+
             page += 1
         elif response.status_code == 403:
             print("Note: Billing usage API access forbidden. "
@@ -499,6 +542,14 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
         else:
             print(f"Note: Billing usage API returned {response.status_code}")
             return None
+
+    # page exceeds MAX_BILLING_PAGES only when the last full page was fetched
+    # and then page was incremented past the cap — i.e. the loop exited via the
+    # while condition rather than a break, meaning more pages still exist.
+    if page > MAX_BILLING_PAGES:
+        print("Warning: Billing usage API page limit reached. "
+              "For large enterprises the dataset may be incomplete; "
+              "AI-credit totals will fall back to Copilot-specific API sources.")
 
     return {"usageItems": all_items} if all_items else None
 
