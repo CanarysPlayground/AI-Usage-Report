@@ -1808,12 +1808,13 @@ def main():
         print(f"  Warning: Live billing counter (ai_credits_used) was unavailable for the current "
               f"month. Falling back to per-user NDJSON reports, which lag by ~1 day "
               f"and do not include today's usage.")
-    elif per_user_processed and per_user_processed["total_credits"] > 0:
+    elif not is_current_month and per_user_processed and per_user_processed["total_credits"] > 0:
+        # Historical month fallback: per-user NDJSON if billing usage API returned nothing.
         total_credits = per_user_processed["total_credits"]
         print("  Using per-user metrics for total credits.")
     elif metrics_processed and metrics_processed["total_credits"] > 0:
         total_credits = metrics_processed["total_credits"]
-        print("  Using metrics total for total credits.")
+        print("  Using metrics for total credits.")
     elif not is_current_month and billing_used is not None:
         # Last resort for historical months: billing API counter.
         # WARNING: this reflects the CURRENT billing cycle, not the selected month.
