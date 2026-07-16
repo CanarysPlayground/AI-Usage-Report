@@ -132,13 +132,26 @@ def _get_with_retry(url, headers, params=None, timeout=(10, 30), max_retries=3):
     Uses a (connect_timeout, read_timeout) tuple so a stalled connection is
     detected quickly while still allowing the server up to 30 s to respond.
 
+    Retries on connection/timeout errors and on HTTP 429 (rate limit) or
+    5xx (server) responses.
+
     Returns the response object on success, or raises the last exception if
     all retries are exhausted.
     """
-    delay = 5  # seconds before first retry
+    delay = 5  # initial delay in seconds between retry attempts
     for attempt in range(1, max_retries + 1):
         try:
-            return requests.get(url, headers=headers, params=params, timeout=timeout)
+            response = requests.get(url, headers=headers, params=params, timeout=timeout)
+            # Retry on rate-limit or transient server errors
+            if response.status_code in (429, 500, 502, 503, 504):
+                if attempt == max_retries:
+                    return response
+                print(f"Warning: HTTP {response.status_code} (attempt {attempt}/{max_retries}). "
+                      f"Retrying in {delay}s...")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            return response
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout) as exc:
             if attempt == max_retries:
@@ -460,9 +473,8 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
         params = {"year": year, "month": month, "page": page, "per_page": 100}
         try:
             response = _get_with_retry(url, headers, params=params)
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout) as exc:
-            print(f"Warning: Billing usage API connection failed after retries: {exc}. "
+        except requests.exceptions.RequestException as exc:
+            print(f"Warning: Billing usage API request failed after retries: {exc}. "
                   f"Returning {len(all_items)} items collected so far.")
             break
 
