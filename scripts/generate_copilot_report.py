@@ -1806,8 +1806,7 @@ def main():
         total_credits = per_user_processed["total_credits"]
         print(f"  Warning: Billing API did not return ai_credits_used for the current "
               f"month. Falling back to per-user NDJSON reports, which lag by ~1 day "
-              f"and do not include today's usage. "
-              f"Total (may be understated): {total_credits:,.2f}")
+              f"and do not include today's usage.")
     elif billing_usage_processed and billing_usage_processed["total_credits"] > 0:
         # Month-specific billing usage API — always the correct source for
         # historical months; also a valid cross-check for the current month.
