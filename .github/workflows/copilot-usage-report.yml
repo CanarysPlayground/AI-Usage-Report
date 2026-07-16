@@ -5,7 +5,9 @@ on:
   schedule:
     - cron: '0 3 1 * *'
 
-  # Manual trigger with month selection
+  # Manual trigger with month selection.
+  # New months are automatically appended to this list by the
+  # update-report-options workflow on the 1st of each month.
   workflow_dispatch:
     inputs:
       month_selection:
@@ -15,37 +17,8 @@ on:
         options:
           - last_month
           - current_month
-          - '2026-06'
           - '2026-07'
-          - '2026-08'
-          - '2026-09'
-          - '2026-10'
-          - '2026-11'
-          - '2026-12'
-          - '2027-01'
-          - '2027-02'
-          - '2027-03'
-          - '2027-04'
-          - '2027-05'
-          - '2027-06'
-          - '2027-07'
-          - '2027-08'
-          - '2027-09'
-          - '2027-10'
-          - '2027-11'
-          - '2027-12'
-          - '2028-01'
-          - '2028-02'
-          - '2028-03'
-          - '2028-04'
-          - '2028-05'
-          - '2028-06'
-          - '2028-07'
-          - '2028-08'
-          - '2028-09'
-          - '2028-10'
-          - '2028-11'
-          - '2028-12'
+          - '2026-06'
         default: 'last_month'
 
 jobs:

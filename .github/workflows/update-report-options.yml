@@ -1,0 +1,49 @@
+name: Update Report Month Options
+
+# Runs on the 1st of every month (after the main report workflow at 3:00 AM UTC)
+# and adds the newly inaccessible past month to the dropdown options in
+# copilot-usage-report.yml so the report can always be re-run for any
+# historical month since the AI-credits model launched (June 2026).
+on:
+  schedule:
+    - cron: '30 3 1 * *'   # 1st of each month, 3:30 AM UTC (after the report run)
+
+  workflow_dispatch:        # allow manual trigger for testing / backfill
+
+jobs:
+  update-options:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # needed to commit back to the default branch
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Use default GITHUB_TOKEN so the commit is attributed to the bot.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Add new past month to report options
+        run: python scripts/update_month_options.py
+
+      - name: Commit and push if options changed
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git diff --quiet && echo "No changes to commit." && exit 0
+          MONTH=$(python -c "
+          from datetime import datetime, timedelta
+          today = datetime.now()
+          first = today.replace(day=1)
+          last = (first - timedelta(days=1)).replace(day=1)
+          two_ago = (last - timedelta(days=1)).replace(day=1)
+          print(two_ago.strftime('%Y-%m'))
+          ")
+          git add .github/workflows/copilot-usage-report.yml
+          git commit -m "chore: add ${MONTH} to report month options"
+          git push
