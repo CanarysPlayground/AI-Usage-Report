@@ -398,7 +398,14 @@ def fetch_copilot_billing(enterprise, token):
     response = requests.get(billing_url, headers=headers, timeout=30)
 
     if response.status_code == 200:
-        return response.json()
+        data = response.json()
+        if isinstance(data, dict):
+            top_keys = list(data.keys())
+            print(f"  Billing API response keys: {top_keys}")
+            ai_obj = data.get("ai_credits")
+            if isinstance(ai_obj, dict):
+                print(f"  Billing API 'ai_credits' sub-keys: {list(ai_obj.keys())}")
+        return data
     else:
         print(f"Warning: Could not fetch billing data: {response.status_code}")
         return None
@@ -867,6 +874,9 @@ def process_billing_usage_data(billing_usage, cost_centers):
         #   "Copilot Premium Model Requests"    – premium model variant
         #   "Copilot Credits"                   – simplified SKU variant
         #   "Copilot AI Requests"               – another variant
+        #   "Copilot Model Requests"            – model-specific variant
+        #   "Copilot Usage"                     – generic usage SKU variant
+        #   "Copilot Premium Usage"             – premium usage variant
         # We require the item to be Copilot-branded AND to reference one of the
         # specific AI-credit-related SKU phrases to avoid matching seat/license
         # or other Copilot line items (e.g. "Copilot for Business Seat").
@@ -877,7 +887,14 @@ def process_billing_usage_data(billing_usage, cost_centers):
             "premium request", "ai credit", "premium model",
             "add-on premium", "addon premium",
             "copilot credit", "ai request",
+            "model request", "premium usage",
+            "copilot usage",
         ))
+        # Broader fallback: Copilot product with request/credit unit type,
+        # but only when the SKU does NOT look like a seat/license line item.
+        _is_seat_sku = any(kw in sku for kw in ("seat", "license", "subscription", "user"))
+        if not is_ai_usage and is_copilot and not _is_seat_sku:
+            is_ai_usage = unit_type in ("request", "requests", "credit", "credits")
 
         if not (is_copilot and is_ai_usage):
             continue
@@ -1245,8 +1262,19 @@ def generate_report(report_data, billing_data, month_name,
             billing_data.get("allocated_ai_credits"),
             billing_data.get("monthly_included_ai_credits"),
             billing_data.get("copilot_included_ai_credits"),
+            billing_data.get("ai_credits_included"),
+            billing_data.get("ai_credits_limit"),
+            billing_data.get("total_ai_credits"),
+            billing_data.get("ai_credits_pool"),
             ai_credits_nested.get("included"),
             ai_credits_nested.get("allocated"),
+            ai_credits_nested.get("limit"),
+            ai_credits_nested.get("total"),
+            ai_credits_nested.get("pool"),
+            ai_credits_nested.get("purchased"),
+            ai_credits_nested.get("credits"),
+            ai_credits_nested.get("cycle_limit"),
+            ai_credits_nested.get("available_this_cycle"),
         )
         for value in included_candidates:
             parsed = _coerce_number(value)
@@ -1254,6 +1282,10 @@ def generate_report(report_data, billing_data, month_name,
                 pooled_credits = int(parsed)
                 print(f"  Pooled credits from billing API (current cycle): {pooled_credits:,}")
                 break
+
+        if pooled_credits == "N/A":
+            print("  Note: Billing API response did not contain a recognised "
+                  "included_ai_credits field (pooled credits).")
 
     # Primary computation: derive from billing API's plan_type + active seat count.
     # For the current month this is used only when the raw field is absent.
@@ -1569,14 +1601,25 @@ def main():
             billing_data.get("ai_credits_used_this_cycle"),
             billing_data.get("total_ai_credits_used"),
             billing_data.get("copilot_ai_credits_used"),
+            billing_data.get("ai_credits_consumed"),
+            billing_data.get("total_ai_credits_consumed"),
+            billing_data.get("credits_used"),
             ai_credits_nested.get("used"),
             ai_credits_nested.get("consumed"),
+            ai_credits_nested.get("total_used"),
+            ai_credits_nested.get("usage"),
+            ai_credits_nested.get("used_this_cycle"),
+            ai_credits_nested.get("credits_used"),
         )
         for value in used_candidates:
             parsed = _coerce_number(value)
             if parsed is not None:
                 billing_used = parsed
                 break
+
+    if billing_used is None and billing_data:
+        print("  Note: Billing API response did not contain a recognised "
+              "ai_credits_used field (consumed credits).")
 
     if is_current_month and billing_used is not None:
         # Live counter from the billing API — accurate for the current billing cycle.
