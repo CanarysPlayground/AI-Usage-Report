@@ -1791,14 +1791,15 @@ def main():
     if is_current_month and billing_used is not None:
         # Live counter from the billing API — most up-to-date for the current cycle.
         total_credits = billing_used
-        print(f"  Using billing API ai_credits_used (current billing cycle): "
-              f"{total_credits:,.2f}")
-    elif is_current_month and billing_usage_processed and billing_usage_processed["total_credits"] > 0:
-        # Month-specific billing usage API provides current month-to-date totals
-        # and is more accurate than per-user NDJSON (which can lag by ~1 day).
+        print("  Using billing API ai_credits_used (current billing cycle).")
+    elif billing_usage_processed and billing_usage_processed["total_credits"] > 0:
+        # Month-specific billing usage API is preferred over per-user NDJSON for
+        # both current month (month-to-date) and historical month selection.
         total_credits = billing_usage_processed["total_credits"]
-        print(f"  Using billing usage API total (current month-to-date): "
-              f"{total_credits:,.2f}")
+        if is_current_month:
+            print("  Using billing usage API total (current month-to-date).")
+        else:
+            print("  Using billing usage API total (month-specific historical selection).")
     elif is_current_month and per_user_processed and per_user_processed["total_credits"] > 0:
         # Per-user NDJSON reports are generated daily with ~1-day lag; for the
         # current month this covers all completed days but not today.
@@ -1807,11 +1808,6 @@ def main():
         print(f"  Warning: Billing API did not return ai_credits_used for the current "
               f"month. Falling back to per-user NDJSON reports, which lag by ~1 day "
               f"and do not include today's usage.")
-    elif billing_usage_processed and billing_usage_processed["total_credits"] > 0:
-        # Month-specific billing usage API — always the correct source for
-        # historical months; also a valid cross-check for the current month.
-        total_credits = billing_usage_processed["total_credits"]
-        print(f"  Using billing usage API total (month-specific): {total_credits:,.2f}")
     elif per_user_processed and per_user_processed["total_credits"] > 0:
         total_credits = per_user_processed["total_credits"]
         print(f"  Using per-user metrics for total credits: {total_credits:,.2f}")
