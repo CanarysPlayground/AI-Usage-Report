@@ -528,13 +528,12 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
 
             # Primary pagination: GitHub Link header signals the next page.
             link_header = response.headers.get("Link", "")
-            if 'rel="next"' in link_header:
-                page += 1
-                continue
+            has_next_page = 'rel="next"' in link_header
 
             # Fallback pagination: some responses omit Link headers.
-            # Keep fetching while pages are full-size; stop on the first short page.
-            if len(items) < observed_page_size:
+            # Without an explicit next-page link, keep fetching while pages are
+            # full-size; stop on the first short page.
+            if not has_next_page and len(items) < observed_page_size:
                 break
 
             page += 1
