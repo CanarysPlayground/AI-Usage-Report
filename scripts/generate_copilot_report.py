@@ -517,22 +517,23 @@ def fetch_enterprise_billing_usage(enterprise, token, year, month):
             print(f"  Billing usage page {page}: {len(items)} items "
                   f"(total so far: {len(all_items)})")
 
-            # Primary termination: GitHub Link header signals the last page.
-            link_header = response.headers.get("Link", "")
-            if 'rel="next"' not in link_header:
-                break
-
             # Guard: an empty page means there is no more data.
             if len(items) == 0:
                 break
 
-            # Fallback: if no Link header, use observed page size to detect
-            # the last page.  observed_page_size is fixed on the first page so
-            # a short final page correctly triggers the break even when the
-            # server ignores the per_page parameter.
+            # Record observed page size from the first non-empty page. Used as
+            # fallback pagination when the API does not return Link headers.
             if observed_page_size is None:
                 observed_page_size = len(items)
-            if len(items) < observed_page_size:
+
+            # Primary pagination: GitHub Link header signals the next page.
+            link_header = response.headers.get("Link", "")
+            has_next_page = 'rel="next"' in link_header
+
+            # Fallback pagination: some responses omit Link headers.
+            # Without an explicit next-page link, keep fetching while pages are
+            # full-size; stop on the first short page.
+            if not has_next_page and len(items) < observed_page_size:
                 break
 
             page += 1
