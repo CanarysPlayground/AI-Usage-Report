@@ -1275,6 +1275,7 @@ def compute_included_credits(seats_data, billing_month_start):
     # Plan rank (higher = better): enterprise > business > unknown/other.
     _plan_rank = {"enterprise": 2, "business": 1}
     unique_user_plans = {}  # login → plan_type
+    _anon_counter = 0
 
     for seat in seats_data:
         assignee = seat.get("assignee") or {}
@@ -1282,9 +1283,10 @@ def compute_included_credits(seats_data, billing_month_start):
         plan = (seat.get("plan_type") or "").lower().strip()
 
         if not login:
-            # No login to deduplicate on – include directly.
+            # No login to deduplicate on – include directly with a stable key.
             # This should be rare but we handle it gracefully.
-            login = f"__anon_{id(seat)}"
+            _anon_counter += 1
+            login = f"__anon_{_anon_counter}"
 
         current_rank = _plan_rank.get(unique_user_plans.get(login, ""), -1)
         new_rank = _plan_rank.get(plan, 0)
@@ -1793,9 +1795,12 @@ def main():
     elif is_current_month and per_user_processed and per_user_processed["total_credits"] > 0:
         # Per-user NDJSON reports are generated daily with ~1-day lag; for the
         # current month this covers all completed days but not today.
+        # Log a warning since this is a known accuracy limitation.
         total_credits = per_user_processed["total_credits"]
-        print(f"  Using per-user metrics for total credits (current month, "
-              f"data may be missing today's usage): {total_credits:,.2f}")
+        print(f"  Warning: Billing API did not return ai_credits_used for the current "
+              f"month. Falling back to per-user NDJSON reports, which lag by ~1 day "
+              f"and do not include today's usage. "
+              f"Total (may be understated): {total_credits:,.2f}")
     elif billing_usage_processed and billing_usage_processed["total_credits"] > 0:
         # Month-specific billing usage API — always the correct source for
         # historical months; also a valid cross-check for the current month.
