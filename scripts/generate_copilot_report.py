@@ -1302,6 +1302,73 @@ def compute_included_credits(seats_data, billing_month_start):
     return total
 
 
+def extract_consumed_credits_from_billing(billing_data):
+    """
+    Extract total AI credits consumed this billing cycle from the Copilot
+    billing API response.
+
+    This value matches what is shown on the GitHub Copilot AI usage page
+    (e.g., "32,909 / 61,000 AI credits") and is only valid for the current
+    billing cycle — the billing API carries no month parameter.
+
+    Args:
+        billing_data: Response dict from /enterprises/{e}/copilot/billing.
+
+    Returns:
+        int  – total AI credits consumed, or None if the field is absent.
+    """
+    if not billing_data:
+        return None
+
+    ai_credits_nested = billing_data.get("ai_credits") or {}
+    if not isinstance(ai_credits_nested, dict):
+        ai_credits_nested = {}
+
+    consumed_candidates = (
+        billing_data.get("ai_credits_used"),
+        billing_data.get("total_ai_credits_used"),
+        billing_data.get("consumed_ai_credits"),
+        billing_data.get("ai_credits_consumed"),
+        ai_credits_nested.get("used"),
+        ai_credits_nested.get("used_this_cycle"),
+        ai_credits_nested.get("used_this_billing_cycle"),
+        ai_credits_nested.get("consumed"),
+        ai_credits_nested.get("consumed_this_cycle"),
+        ai_credits_nested.get("total_used"),
+    )
+    for value in consumed_candidates:
+        parsed = _coerce_number(value)
+        if parsed is not None and parsed >= 0:
+            return int(parsed)
+
+    return None
+
+
+def extract_total_licensed_seats(billing_data):
+    """
+    Extract total licensed seat count from the Copilot billing API response.
+
+    Uses seat_breakdown.total which includes ALL assigned seats regardless
+    of whether they have been active in the current cycle.  This matches
+    the "19 billable licenses" figure shown on the GitHub Copilot management
+    page, whereas active-user counts only reflect users who actually used
+    Copilot.
+
+    Returns:
+        int  – total licensed seats, or None if unavailable.
+    """
+    if not billing_data:
+        return None
+    seat_breakdown = billing_data.get("seat_breakdown") or {}
+    if not isinstance(seat_breakdown, dict):
+        return None
+    total = seat_breakdown.get("total")
+    if total is not None:
+        parsed = _coerce_number(total)
+        return int(parsed) if parsed is not None else None
+    return None
+
+
 def compute_included_credits_from_billing(billing_data, billing_month_start):
     """
     Compute allocated AI credits directly from the Copilot billing API response.
@@ -1481,7 +1548,7 @@ def generate_report(report_data, billing_data, month_name,
     else:
         report_lines.append(f"  Pooled Credits (Allocated): {pooled_credits}")
     report_lines.append(f"  Total AI Credits Used:   {total_credits:,.2f}")
-    report_lines.append(f"  Total Unique Active Users: {unique_users:,}")
+    report_lines.append(f"  Total Users (Licensed):    {unique_users:,}")
     report_lines.append("")
     report_lines.append("")
 
@@ -1574,7 +1641,7 @@ def generate_report(report_data, billing_data, month_name,
     writer.writerow(["OVERALL METRICS"])
     writer.writerow(["Pooled Credits (Allocated)", pooled_credits])
     writer.writerow(["Total AI Credits Used", f"{total_credits:.2f}"])
-    writer.writerow(["Total Unique Active Users", unique_users])
+    writer.writerow(["Total Users (Licensed)", unique_users])
     writer.writerow([])
 
     # Cost Center breakdown
@@ -1736,58 +1803,73 @@ def main():
               f"({len(seats_data)} total seat entries)")
 
     # ── Step 3: Assemble final report_data ────────────────────────────────────
-    # Consumed credits: enterprise billing usage API is the single source.
-    # It accepts year + month parameters so it returns the correct data for
-    # both the current month (month-to-date) and any historical month.
+    # Consumed AI credits:
+    #   - For the CURRENT month: use the Copilot billing API's ai_credits_used
+    #     field.  This is the exact same value shown on the GitHub Copilot AI
+    #     usage page ("32,909 / 61,000 AI credits") and is authoritative.
+    #   - For HISTORICAL months: use the per-user metrics sum (ai_credits_used
+    #     per user per day, aggregated over the selected month).
+    #   - The enterprise billing usage API (/settings/billing/usage) is NOT used
+    #     as the primary credit source because its quantity field represents raw
+    #     model tokens/requests, not the AI-credit unit shown in the Copilot UI.
+    #     At scale this produces values millions of times larger than the actual
+    #     AI-credit consumption.
 
     total_credits = 0
     unique_users = 0
     model_breakdown = {}
     cost_center_breakdown = {}
 
-    # Consumed credits — billing usage API only (month-specific).
-    if billing_usage_processed and billing_usage_processed["total_credits"] > 0:
-        total_credits = billing_usage_processed["total_credits"]
-        print("  Consumed credits sourced from billing usage API.")
-    else:
-        print("  Warning: Billing usage API returned no AI credit data for this month.")
-        print("  Ensure the token has 'manage_billing:copilot' and 'read:enterprise' "
-              "scopes and that there is Copilot usage for the selected month.")
+    # Consumed credits — Copilot billing API (current month) or per-user sum.
+    if is_current_month and billing_data:
+        billing_consumed = extract_consumed_credits_from_billing(billing_data)
+        if billing_consumed is not None:
+            total_credits = billing_consumed
+            print(f"  Consumed credits from Copilot billing API (current cycle): {total_credits:,}")
 
-    # User count: licensed seats are the authoritative value.
-    # Only fall back to per-user active users when the seats API is unavailable.
-    if seat_user_count > 0:
+    if total_credits == 0 and per_user_processed and per_user_processed["total_credits"] > 0:
+        total_credits = per_user_processed["total_credits"]
+        print(f"  Consumed credits from per-user metrics (sum of ai_credits_used): "
+              f"{total_credits:,.2f}")
+
+    if total_credits == 0:
+        print("  Warning: Could not determine consumed AI credits.")
+        print("  Ensure the token has 'manage_billing:copilot' scope and that there "
+              "is Copilot usage for the selected month.")
+
+    # User count: total licensed seats is the authoritative value.
+    # seat_breakdown.total from the billing API matches the "billable licenses"
+    # count on the GitHub Copilot management page (e.g. 19 billable licenses).
+    # The seats-list API may return fewer entries when it only enumerates
+    # individually provisioned seats and misses enterprise-level grants.
+    billing_total_seats = extract_total_licensed_seats(billing_data) if billing_data else None
+    if billing_total_seats and billing_total_seats > 0:
+        unique_users = billing_total_seats
+        print(f"  Total licensed users from billing API (seat_breakdown.total): {unique_users}")
+    elif seat_user_count > 0:
         unique_users = seat_user_count
+        print(f"  Total licensed users from seats API: {unique_users}")
     elif per_user_processed and per_user_processed["unique_users"] > 0:
         unique_users = per_user_processed["unique_users"]
         print("  Note: Using active user count from per-user metrics (seats API unavailable).")
 
-    # Model breakdown: prefer billing usage only when model names are present;
-    # otherwise use metrics (which usually carries detailed model names).
-    if billing_usage_processed and billing_usage_processed.get("model_breakdown"):
-        billing_models = billing_usage_processed["model_breakdown"]
-        metrics_models = (metrics_processed.get("model_breakdown")
-                          if metrics_processed else None)
-        if _has_named_models(billing_models) or not metrics_models:
-            model_breakdown = billing_models
-        else:
-            model_breakdown = metrics_models
-            print("  Billing usage model data lacked model names; using metrics model breakdown.")
-    elif metrics_processed and metrics_processed.get("model_breakdown"):
+    # Model breakdown: prefer metrics API (has named models) over billing usage
+    # (which typically returns 'Unknown Model' for AI-credit line items).
+    if metrics_processed and metrics_processed.get("model_breakdown"):
         model_breakdown = metrics_processed["model_breakdown"]
+    elif billing_usage_processed and billing_usage_processed.get("model_breakdown"):
+        billing_models = billing_usage_processed["model_breakdown"]
+        if _has_named_models(billing_models):
+            model_breakdown = billing_models
 
-    # Cost center breakdown: prefer billing usage > per-user org > org metrics
-    if billing_usage_processed and billing_usage_processed.get("cost_center_breakdown"):
-        cost_center_breakdown = billing_usage_processed["cost_center_breakdown"]
-        if per_user_processed and per_user_processed.get("org_breakdown"):
-            cost_center_breakdown = _enrich_cost_center_users(
-                cost_center_breakdown,
-                per_user_processed["org_breakdown"],
-                per_user_processed.get("unique_users", 0)
-            )
-    elif per_user_processed and per_user_processed.get("org_breakdown"):
-        # Map org breakdown to cost center breakdown
+    # Cost center breakdown: prefer per-user org data > billing usage > org metrics.
+    # Billing usage cost-center labels may be present but the credit quantities in
+    # that source are unreliable (token-level, not AI-credit-level), so we use the
+    # per-user org data as the primary cost-center credit source.
+    if per_user_processed and per_user_processed.get("org_breakdown"):
         cost_center_breakdown = per_user_processed["org_breakdown"]
+    elif billing_usage_processed and billing_usage_processed.get("cost_center_breakdown"):
+        cost_center_breakdown = billing_usage_processed["cost_center_breakdown"]
     elif cost_centers:
         print("Building cost-center breakdown from org metrics...")
         cc_breakdown = build_cost_center_metrics(
