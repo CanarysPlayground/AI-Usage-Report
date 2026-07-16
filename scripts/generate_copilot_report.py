@@ -453,9 +453,14 @@ def fetch_copilot_billing(enterprise, token):
         if isinstance(data, dict):
             top_keys = list(data.keys())
             print(f"  Billing API response keys: {top_keys}")
+            # Log the full response as JSON to help diagnose field names for
+            # ai_credits_used / included_ai_credits in the new billing model.
+            print(f"  Billing API full response: {json.dumps(data, default=str)}")
             ai_obj = data.get("ai_credits")
             if isinstance(ai_obj, dict):
                 print(f"  Billing API 'ai_credits' sub-keys: {list(ai_obj.keys())}")
+            elif ai_obj is not None:
+                print(f"  Billing API 'ai_credits' value (non-dict): {ai_obj}")
         return data
     else:
         print(f"Warning: Could not fetch billing data: {response.status_code}")
@@ -1246,6 +1251,12 @@ def compute_included_credits(seats_data, billing_month_start):
     (June 1 – September 1, 2026).  Credits are pooled at the enterprise level,
     so this returns the enterprise-wide pool for the month.
 
+    The enterprise seats API can return duplicate seat objects when the same user
+    is granted Copilot access through multiple organisations or enterprise teams.
+    This function deduplicates by user login, keeping the highest-value plan per
+    user (enterprise > business > unknown), so that each user is counted exactly
+    once regardless of how many orgs they belong to.
+
     Args:
         seats_data:           List of seat objects from the Copilot seats API.
                               Each object must have a ``plan_type`` field.
@@ -1260,9 +1271,28 @@ def compute_included_credits(seats_data, billing_month_start):
     is_promo = _AI_CREDITS_PROMO_START <= billing_month_start < _AI_CREDITS_PROMO_END
     rates = _AI_CREDITS_PER_SEAT_PROMO if is_promo else _AI_CREDITS_PER_SEAT
 
-    total = 0
+    # Deduplicate by user login, keeping the highest-rate plan per user.
+    # Plan rank (higher = better): enterprise > business > unknown/other.
+    _plan_rank = {"enterprise": 2, "business": 1}
+    unique_user_plans = {}  # login → plan_type
+
     for seat in seats_data:
+        assignee = seat.get("assignee") or {}
+        login = (assignee.get("login", "") if isinstance(assignee, dict) else "")
         plan = (seat.get("plan_type") or "").lower().strip()
+
+        if not login:
+            # No login to deduplicate on – include directly.
+            # This should be rare but we handle it gracefully.
+            login = f"__anon_{id(seat)}"
+
+        current_rank = _plan_rank.get(unique_user_plans.get(login, ""), -1)
+        new_rank = _plan_rank.get(plan, 0)
+        if login not in unique_user_plans or new_rank > current_rank:
+            unique_user_plans[login] = plan
+
+    total = 0
+    for plan in unique_user_plans.values():
         rate = rates.get(plan, _AI_CREDITS_PER_SEAT_DEFAULT)
         total += rate
 
@@ -1339,18 +1369,52 @@ def generate_report(report_data, billing_data, month_name,
     cost_center_breakdown = report_data["cost_center_breakdown"]
     model_breakdown = report_data["model_breakdown"]
 
-    # Get pooled (allocated) credits from billing data.
-    # As of June 2026, the billing API returns included_ai_credits directly.
-    # Only use included/allocated fields to avoid mixing in non-pool metrics.
+    # Get pooled (allocated) credits.
+    # Priority:
+    #   1. Per-seat computation (compute_included_credits): iterates every seat's
+    #      own plan_type and deduplicates by user login.  This is the most accurate
+    #      approach for mixed Business + Enterprise plans and is always preferred
+    #      when seats_data is available.
+    #   2. Billing API direct field (included_ai_credits etc.): only used as a
+    #      fallback when seats_data is absent.  The billing API's seat count may
+    #      differ from the actual billed-user count (e.g. it may include duplicates
+    #      for users in multiple organisations), which can produce incorrect totals.
+    #   3. Billing API seat-count computation (compute_included_credits_from_billing):
+    #      last resort — uses a single enterprise-level plan_type applied to all seats,
+    #      which is inaccurate for mixed-plan enterprises.
     #
-    # IMPORTANT: The Copilot billing API (/enterprises/{e}/copilot/billing) has no
-    # month parameter — it always returns data for the CURRENT billing cycle.
-    # Therefore we only read included_ai_credits from it when the user selected the
-    # current month.  For historical months we skip straight to the computed approach
-    # (current seat count × rate for the selected month) which is the most accurate
-    # value obtainable from the public API for past periods.
+    # NOTE: The Copilot billing API (/enterprises/{e}/copilot/billing) has no month
+    # parameter — it always reflects the CURRENT billing cycle.  Any direct field
+    # values from it are therefore only valid when is_current_month=True.
     pooled_credits = "N/A"
-    if billing_data and is_current_month:
+
+    # ── Priority 1: per-seat computation (most accurate) ─────────────────────
+    if seats_data and billing_start_date:
+        computed = compute_included_credits(seats_data, billing_start_date)
+        if computed:
+            pooled_credits = computed
+            is_promo = (_AI_CREDITS_PROMO_START <= billing_start_date
+                        < _AI_CREDITS_PROMO_END)
+            period_label = "promotional" if is_promo else "standard"
+            month_label = "current month" if is_current_month else "selected month"
+            # Count unique users (deduplicated) for the log line.
+            unique_logins = set()
+            for _seat in seats_data:
+                _assignee = _seat.get("assignee") or {}
+                _login = (_assignee.get("login", "")
+                          if isinstance(_assignee, dict) else "")
+                if _login:
+                    unique_logins.add(_login)
+            n_unique = len(unique_logins) or len(seats_data)
+            print(f"  Pooled credits computed from {n_unique} unique licensed seat(s) "
+                  f"({len(seats_data)} total seat entries, deduplicated) "
+                  f"using per-seat plan_type ({period_label} rates, {month_label}) "
+                  f"→ {pooled_credits:,}")
+
+    # ── Priority 2: billing API direct field (current month only) ────────────
+    # Only use when per-seat data is absent, to avoid replacing accurate per-seat
+    # values with potentially miscounted API totals.
+    if pooled_credits == "N/A" and billing_data and is_current_month:
         ai_credits_nested = billing_data.get("ai_credits") or {}
         if not isinstance(ai_credits_nested, dict):
             ai_credits_nested = {}
@@ -1366,13 +1430,16 @@ def generate_report(report_data, billing_data, month_name,
             billing_data.get("total_ai_credits"),
             billing_data.get("ai_credits_pool"),
             ai_credits_nested.get("included"),
+            ai_credits_nested.get("included_this_cycle"),
+            ai_credits_nested.get("included_this_billing_cycle"),
             ai_credits_nested.get("allocated"),
+            ai_credits_nested.get("allocated_this_cycle"),
             ai_credits_nested.get("limit"),
+            ai_credits_nested.get("cycle_limit"),
             ai_credits_nested.get("total"),
             ai_credits_nested.get("pool"),
             ai_credits_nested.get("purchased"),
             ai_credits_nested.get("credits"),
-            ai_credits_nested.get("cycle_limit"),
             ai_credits_nested.get("available_this_cycle"),
         )
         for value in included_candidates:
@@ -1386,37 +1453,19 @@ def generate_report(report_data, billing_data, month_name,
             print("  Note: Billing API response did not contain a recognised "
                   "included_ai_credits field (pooled credits).")
 
-    # Primary computation: derive from billing API's plan_type + active seat count.
-    # For the current month this is used only when the raw field is absent.
-    # For historical months this is the primary (and only) reliable approach because
-    # the billing API's included_ai_credits reflects the current cycle, not history.
+    # ── Priority 3: billing API seat-count computation (last resort) ──────────
     if pooled_credits == "N/A" and billing_data and billing_start_date:
         computed = compute_included_credits_from_billing(billing_data, billing_start_date)
         if computed:
             pooled_credits = computed
-            # compute_included_credits_from_billing already prints a breakdown line;
-            # add a context tag so it's clear this is for the selected month.
             month_label = "current month" if is_current_month else "selected month"
             print(f"  Pooled credits computed from billing API seat data "
                   f"(for {month_label}): {pooled_credits:,}")
 
-    # Secondary computation: derive from per-seat plan_type in the seats list.
-    # More precise when seats have mixed plan types, but requires the seats API call.
-    if pooled_credits == "N/A" and seats_data and billing_start_date:
-        computed = compute_included_credits(seats_data, billing_start_date)
-        if computed:
-            pooled_credits = computed
-            is_promo = (_AI_CREDITS_PROMO_START <= billing_start_date
-                        < _AI_CREDITS_PROMO_END)
-            period_label = "promotional" if is_promo else "standard"
-            month_label = "current month" if is_current_month else "selected month"
-            print(f"Note: Pooled credits computed from {len(seats_data)} seat(s) "
-                  f"using per-seat plan_type ({period_label} rates, {month_label}) "
-                  f"→ {pooled_credits:,}")
-
-    if pooled_credits == "N/A" and billing_data:
+    if pooled_credits == "N/A":
         print("Warning: Could not determine pooled (allocated) AI credits. "
-              "The billing API did not return plan_type / seat_breakdown data.")
+              "No seats data available and the billing API did not return "
+              "plan_type / seat_breakdown data.")
 
     report_lines = []
     report_lines.append(f"GitHub Copilot USAGE SUMMARY REPORT - {month_name.upper()}")
@@ -1668,19 +1717,30 @@ def main():
     billing_usage_processed = process_billing_usage_data(billing_usage, cost_centers)
 
     # Get seat count — this is the authoritative count of Copilot licensed users.
+    # Deduplicate by user login to avoid double-counting users granted access
+    # through multiple organisations or enterprise teams.
     seat_user_count = 0
     if seats_data:
-        seat_user_count = len(seats_data)
-        print(f"  Copilot licensed seats: {seat_user_count} users")
+        _seen_logins = set()
+        for _seat in seats_data:
+            _assignee = _seat.get("assignee") or {}
+            _login = (_assignee.get("login", "")
+                      if isinstance(_assignee, dict) else "")
+            if _login:
+                _seen_logins.add(_login)
+        seat_user_count = len(_seen_logins) if _seen_logins else len(seats_data)
+        print(f"  Copilot licensed seats: {seat_user_count} unique users "
+              f"({len(seats_data)} total seat entries)")
 
     # ── Step 3: Assemble final report_data ────────────────────────────────────
     # Priority for consumed credits:
-    #   Current month:   billing API (live counter) > billing usage API >
-    #                    per-user metrics > enterprise metrics aggregate
+    #   Current month:   billing API (live counter) > per-user metrics >
+    #                    billing usage API > enterprise metrics aggregate
     #   Historical month: billing usage API (month-specific, exact) >
     #                    per-user metrics > enterprise metrics aggregate >
     #                    billing API as last resort (current-cycle data, may be wrong)
-    # Priority for user count: per-user metrics > seats > metrics estimate
+    # Priority for user count: per-user metrics > seats (deduplicated) >
+    #                          metrics estimate
 
     total_credits = 0
     unique_users = 0
@@ -1689,6 +1749,7 @@ def main():
 
     # Read ai_credits_used from the billing API.
     # This field is CURRENT-CYCLE ONLY — it is only valid when is_current_month=True.
+    # The exact field name depends on the API version; we try all known variants.
     billing_used = None
     if billing_data:
         ai_credits_nested = billing_data.get("ai_credits") or {}
@@ -1704,11 +1765,15 @@ def main():
             billing_data.get("total_ai_credits_consumed"),
             billing_data.get("credits_used"),
             ai_credits_nested.get("used"),
+            ai_credits_nested.get("used_this_cycle"),
+            ai_credits_nested.get("used_this_billing_cycle"),
             ai_credits_nested.get("consumed"),
+            ai_credits_nested.get("consumed_this_cycle"),
             ai_credits_nested.get("total_used"),
             ai_credits_nested.get("usage"),
-            ai_credits_nested.get("used_this_cycle"),
             ai_credits_nested.get("credits_used"),
+            ai_credits_nested.get("current_usage"),
+            ai_credits_nested.get("monthly_usage"),
         )
         for value in used_candidates:
             parsed = _coerce_number(value)
@@ -1721,10 +1786,16 @@ def main():
               "ai_credits_used field (consumed credits).")
 
     if is_current_month and billing_used is not None:
-        # Live counter from the billing API — accurate for the current billing cycle.
+        # Live counter from the billing API — most up-to-date for the current cycle.
         total_credits = billing_used
         print(f"  Using billing API ai_credits_used (current billing cycle): "
               f"{total_credits:,.2f}")
+    elif is_current_month and per_user_processed and per_user_processed["total_credits"] > 0:
+        # Per-user NDJSON reports are generated daily with ~1-day lag; for the
+        # current month this covers all completed days but not today.
+        total_credits = per_user_processed["total_credits"]
+        print(f"  Using per-user metrics for total credits (current month, "
+              f"data may be missing today's usage): {total_credits:,.2f}")
     elif billing_usage_processed and billing_usage_processed["total_credits"] > 0:
         # Month-specific billing usage API — always the correct source for
         # historical months; also a valid cross-check for the current month.
@@ -1746,7 +1817,7 @@ def main():
               f"{total_credits:,.2f}")
 
     # User count: prefer active unique users from per-user metrics; fallback to
-    # seat count (licensed users) then aggregate metrics estimate.
+    # deduplicated seat count (licensed users) then aggregate metrics estimate.
     if per_user_processed and per_user_processed["unique_users"] > 0:
         unique_users = per_user_processed["unique_users"]
     elif seat_user_count > 0:
