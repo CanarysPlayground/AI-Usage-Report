@@ -1806,13 +1806,14 @@ def process_ai_usage_metrics(ai_usage_metrics):
             if not isinstance(m, dict):
                 continue
             name = (m.get("name") or m.get("model_name") or m.get("model") or "Unknown")
-            credits = (
-                _coerce_number(m.get("credits_used"))
-                or _coerce_number(m.get("total_credits"))
-                or _coerce_number(m.get("included_credits"))
-                or 0.0
+            # Use explicit None checks so a legitimate 0 value is not skipped.
+            credits = next(
+                (v for key in ("credits_used", "total_credits", "included_credits")
+                 if (v := _coerce_number(m.get(key))) is not None),
+                0.0,
             )
-            add_credits = _coerce_number(m.get("additional_credits")) or 0.0
+            add_credits_raw = _coerce_number(m.get("additional_credits"))
+            add_credits = add_credits_raw if add_credits_raw is not None else 0.0
             model_breakdown[name] = {
                 "total": credits + add_credits,
                 "included": credits,
@@ -1832,10 +1833,12 @@ def process_ai_usage_metrics(ai_usage_metrics):
                 continue
             name = (cc.get("name") or cc.get("cost_center") or
                     cc.get("cost_center_name") or "Unknown")
-            credits = _coerce_number(
-                cc.get("credits_used") or cc.get("total_credits") or
-                cc.get("credits") or 0
-            ) or 0.0
+            # Use explicit None checks so a legitimate 0 value is not skipped.
+            credits = next(
+                (v for key in ("credits_used", "total_credits", "credits")
+                 if (v := _coerce_number(cc.get(key))) is not None),
+                0.0,
+            )
             users_raw = cc.get("users") or cc.get("user_count") or 0
             user_count = (len(users_raw) if isinstance(users_raw, list)
                           else int(_coerce_number(users_raw) or 0))
@@ -1975,8 +1978,10 @@ def generate_report(report_data, billing_data, month_name,
               "plan_type / seat_breakdown data.")
 
     # Compute remaining credits when both allocated and consumed are known.
+    # Explicitly convert pooled_credits to float to ensure consistent arithmetic
+    # regardless of whether it was set as int (from billing API) or float.
     if pooled_credits != "N/A":
-        remaining_credits = max(0, pooled_credits - total_credits)
+        remaining_credits = max(0.0, float(pooled_credits) - total_credits)
     else:
         remaining_credits = "N/A"
 
@@ -2363,7 +2368,7 @@ def main():
     #     At scale this produces values millions of times larger than the actual
     #     AI-credit consumption.
 
-    total_credits = 0
+    total_credits = None  # None = not yet determined; use sentinel to distinguish 0 from "unknown"
     unique_users = 0
     model_breakdown = {}
     cost_center_breakdown = {}
@@ -2373,29 +2378,34 @@ def main():
     #   2. AI usage metrics endpoint (new API, if available)
     #   3. Per-user metrics sum (historical months)
     #   4. Billing usage-summary API
+    # We use None as a sentinel so that a genuine 0-credit result is not confused
+    # with "no data found".
     if is_current_month and billing_data:
         billing_consumed = extract_consumed_credits_from_billing(billing_data)
         if billing_consumed is not None:
             total_credits = billing_consumed
             print(f"  Consumed credits from Copilot billing API (current cycle): {total_credits:,}")
 
-    if total_credits == 0 and ai_metrics_processed and ai_metrics_processed.get("consumed_credits"):
-        total_credits = ai_metrics_processed["consumed_credits"]
-        print(f"  Consumed credits from AI usage metrics API: {total_credits:,.2f}")
+    if total_credits is None and ai_metrics_processed:
+        ai_consumed = ai_metrics_processed.get("consumed_credits")
+        if ai_consumed is not None:
+            total_credits = ai_consumed
+            print(f"  Consumed credits from AI usage metrics API: {total_credits:,.2f}")
 
-    if total_credits == 0 and per_user_processed and per_user_processed["total_credits"] > 0:
+    if total_credits is None and per_user_processed and per_user_processed["total_credits"] > 0:
         total_credits = per_user_processed["total_credits"]
         print(f"  Consumed credits from per-user metrics (sum of ai_credits_used): "
               f"{total_credits:,.2f}")
 
-    if total_credits == 0 and usage_summary_processed and usage_summary_processed["total_credits"] > 0:
+    if total_credits is None and usage_summary_processed and usage_summary_processed["total_credits"] > 0:
         total_credits = usage_summary_processed["total_credits"]
         print(f"  Consumed credits from billing usage-summary API: {total_credits:,.2f}")
 
-    if total_credits == 0:
+    if total_credits is None:
         print("  Warning: Could not determine consumed AI credits.")
         print("  Ensure the token has 'manage_billing:copilot' scope and that there "
               "is Copilot usage for the selected month.")
+        total_credits = 0
 
     # User count priority:
     #   1. Copilot billing API seat_breakdown.total (authoritative)
