@@ -1339,6 +1339,29 @@ def _coerce_number(value):
     return None
 
 
+def _find_first_valid_number(source_dict, keys, default=0.0):
+    """
+    Return the first non-None _coerce_number result for the given keys in source_dict.
+
+    Unlike chained ``or`` expressions this correctly handles the case where a key
+    is present and its value is 0 — ``or`` would skip 0 and fall through to the
+    next key, while this function treats 0 as a valid (found) value.
+
+    Args:
+        source_dict: dict to look up.
+        keys:        iterable of key names to try in order.
+        default:     value to return when all keys are absent or None.
+
+    Returns:
+        float value of the first valid key, or ``default`` if none found.
+    """
+    for key in keys:
+        val = _coerce_number(source_dict.get(key))
+        if val is not None:
+            return val
+    return default
+
+
 def _has_named_models(model_breakdown):
     """Return True when a model breakdown contains at least one named model."""
     if not model_breakdown:
@@ -1806,11 +1829,8 @@ def process_ai_usage_metrics(ai_usage_metrics):
             if not isinstance(m, dict):
                 continue
             name = (m.get("name") or m.get("model_name") or m.get("model") or "Unknown")
-            # Use explicit None checks so a legitimate 0 value is not skipped.
-            credits = next(
-                (v for key in ("credits_used", "total_credits", "included_credits")
-                 if (v := _coerce_number(m.get(key))) is not None),
-                0.0,
+            credits = _find_first_valid_number(
+                m, ("credits_used", "total_credits", "included_credits")
             )
             add_credits_raw = _coerce_number(m.get("additional_credits"))
             add_credits = add_credits_raw if add_credits_raw is not None else 0.0
@@ -1833,17 +1853,17 @@ def process_ai_usage_metrics(ai_usage_metrics):
                 continue
             name = (cc.get("name") or cc.get("cost_center") or
                     cc.get("cost_center_name") or "Unknown")
-            # Use explicit None checks so a legitimate 0 value is not skipped.
-            credits = next(
-                (v for key in ("credits_used", "total_credits", "credits")
-                 if (v := _coerce_number(cc.get(key))) is not None),
-                0.0,
+            credits = _find_first_valid_number(
+                cc, ("credits_used", "total_credits", "credits")
             )
             users_raw = cc.get("users") or cc.get("user_count") or 0
             user_count = (len(users_raw) if isinstance(users_raw, list)
-                          else int(_coerce_number(users_raw) or 0))
+                          else round(_coerce_number(users_raw) or 0))
             cc_breakdown[name] = {
                 "credits": credits,
+                # `users` is the set of login strings; populated by downstream callers
+                # that have per-user data (e.g. _enrich_cost_center_users).
+                # _get_user_count() prefers user_count when the set is empty.
                 "users": set(),
                 "user_count": user_count,
             }
