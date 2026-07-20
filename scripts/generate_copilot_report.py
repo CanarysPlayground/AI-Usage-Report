@@ -17,7 +17,7 @@ import json
 import csv
 import io
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 import requests
@@ -1620,7 +1620,7 @@ def fetch_ai_usage(enterprise, token, start_date, end_date,
     Endpoint: GET /enterprises/{enterprise}/ai_usage
 
     Supported query parameters:
-      since / until  – ISO 8601 date strings for the reporting window
+      since, until   – ISO 8601 date strings for the reporting window
       group_by       – dimension to group results by (e.g. 'models', 'cost_center')
       cost_center    – filter to a specific cost center name
       models         – comma-separated model filter
@@ -1773,7 +1773,7 @@ def process_ai_usage_metrics(ai_usage_metrics):
                 "pooled_credits", "included_ai_credits", "monthly_ai_credits"):
         val = _coerce_number(ai_usage_metrics.get(key))
         if val is not None and val >= 0:
-            result["allocated_credits"] = int(val)
+            result["allocated_credits"] = val  # kept as float for consistency
             break
 
     # ── Consumed credits ─────────────────────────────────────────────────────
@@ -1806,11 +1806,13 @@ def process_ai_usage_metrics(ai_usage_metrics):
             if not isinstance(m, dict):
                 continue
             name = (m.get("name") or m.get("model_name") or m.get("model") or "Unknown")
-            credits = _coerce_number(
-                m.get("credits_used") or m.get("total_credits") or
-                m.get("included_credits") or 0
-            ) or 0.0
-            add_credits = _coerce_number(m.get("additional_credits") or 0) or 0.0
+            credits = (
+                _coerce_number(m.get("credits_used"))
+                or _coerce_number(m.get("total_credits"))
+                or _coerce_number(m.get("included_credits"))
+                or 0.0
+            )
+            add_credits = _coerce_number(m.get("additional_credits")) or 0.0
             model_breakdown[name] = {
                 "total": credits + add_credits,
                 "included": credits,
@@ -2130,7 +2132,7 @@ def generate_report(report_data, billing_data, month_name,
     # Generate JSON
     json_report = {
         "report_month": month_name,
-        "generated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "overall_metrics": {
             "allocated_credits": pooled_credits if pooled_credits != "N/A" else None,
             "consumed_credits": round(total_credits, 2),
@@ -2308,11 +2310,10 @@ def main():
                   f"consumed={ai_metrics_processed.get('consumed_credits')}, "
                   f"remaining={ai_metrics_processed.get('remaining_credits')}")
 
-    # Also try to process the ai_usage endpoint response with process_ai_usage_metrics
-    # (it may return the same structure as ai_usage_metrics)
-    ai_usage_processed = None
+    # If the dedicated ai_usage_metrics endpoint didn't respond, try parsing the
+    # ai_usage endpoint response with the same processor as a fallback.
     if ai_usage_data and not ai_metrics_processed:
-        ai_usage_processed = process_ai_usage_metrics(
+        ai_metrics_processed = process_ai_usage_metrics(
             ai_usage_data if isinstance(ai_usage_data, dict) else {}
         )
 
