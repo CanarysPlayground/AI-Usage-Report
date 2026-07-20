@@ -1612,10 +1612,246 @@ def compute_included_credits_from_billing(billing_data, billing_month_start):
     return total
 
 
+def fetch_ai_usage(enterprise, token, start_date, end_date,
+                   group_by=None, cost_center=None, models=None):
+    """
+    Fetch enterprise AI usage from the dedicated AI usage endpoint.
+
+    Endpoint: GET /enterprises/{enterprise}/ai_usage
+
+    Supported query parameters:
+      since / until  – ISO 8601 date strings for the reporting window
+      group_by       – dimension to group results by (e.g. 'models', 'cost_center')
+      cost_center    – filter to a specific cost center name
+      models         – comma-separated model filter
+
+    Returns the parsed JSON response (dict or list), or None on failure.
+    """
+    headers = get_auth_headers(token)
+    url = f"https://api.github.com/enterprises/{enterprise}/ai_usage"
+    params = {
+        "since": start_date.strftime("%Y-%m-%d"),
+        "until": end_date.strftime("%Y-%m-%d"),
+    }
+    if group_by:
+        params["group_by"] = group_by
+    if cost_center:
+        params["cost_center"] = cost_center
+    if models:
+        params["models"] = models
+
+    try:
+        response = _get_with_retry(url, headers, params=params)
+    except requests.exceptions.RequestException as exc:
+        print(f"Warning: AI usage API request failed: {exc}")
+        return None
+
+    if response.status_code == 200:
+        data = response.json()
+        print("  AI usage API responded successfully.")
+        if isinstance(data, dict):
+            print(f"  AI usage API keys: {list(data.keys())}")
+        return data
+    elif response.status_code in (403, 404):
+        print(f"Note: AI usage API returned {response.status_code}. "
+              "Endpoint may not be available for this enterprise.")
+        return None
+    else:
+        print(f"Warning: AI usage API returned {response.status_code}")
+        return None
+
+
+def fetch_ai_usage_metrics(enterprise, token, year, month,
+                           group_by=None, cost_center=None, models=None):
+    """
+    Fetch enterprise billing AI usage metrics for a specific month.
+
+    Endpoint: GET /enterprises/{enterprise}/settings/billing/ai_usage_metrics
+
+    Supported query parameters:
+      year       – 4-digit year (e.g. 2026)
+      month      – 1–12
+      group_by   – grouping dimension ('models', 'cost_center', etc.)
+      cost_center – filter to a specific cost center
+      models     – comma-separated model filter
+
+    Returns the parsed JSON response (dict or list), or None on failure.
+    """
+    headers = get_auth_headers(token)
+    url = (f"https://api.github.com/enterprises/{enterprise}"
+           f"/settings/billing/ai_usage_metrics")
+    params = {"year": year, "month": month}
+    if group_by:
+        params["group_by"] = group_by
+    if cost_center:
+        params["cost_center"] = cost_center
+    if models:
+        params["models"] = models
+
+    try:
+        response = _get_with_retry(url, headers, params=params)
+    except requests.exceptions.RequestException as exc:
+        print(f"Warning: AI usage metrics API request failed: {exc}")
+        return None
+
+    if response.status_code == 200:
+        data = response.json()
+        print("  AI usage metrics API responded successfully.")
+        if isinstance(data, dict):
+            print(f"  AI usage metrics keys: {list(data.keys())}")
+        return data
+    elif response.status_code in (403, 404):
+        print(f"Note: AI usage metrics API returned {response.status_code}.")
+        return None
+    else:
+        print(f"Warning: AI usage metrics API returned {response.status_code}")
+        return None
+
+
+def fetch_managed_users(enterprise, token):
+    """
+    Fetch enterprise managed users (SCIM-provisioned accounts).
+
+    Endpoint: GET /enterprises/{enterprise}/managed_users
+
+    Returns a list of user objects, or None on failure.  Used to obtain an
+    accurate total count of licensed enterprise members when the Copilot
+    billing and seats APIs are unavailable.
+    """
+    headers = get_auth_headers(token)
+    url = f"https://api.github.com/enterprises/{enterprise}/managed_users"
+    all_users = []
+    page = 1
+
+    while True:
+        params = {"page": page, "per_page": 100}
+        try:
+            response = _get_with_retry(url, headers, params=params)
+        except requests.exceptions.RequestException as exc:
+            print(f"Warning: Managed users API request failed: {exc}")
+            return None
+
+        if response.status_code == 200:
+            data = response.json()
+            if not isinstance(data, list) or not data:
+                break
+            all_users.extend(data)
+            if len(data) < 100:
+                break
+            page += 1
+        elif response.status_code in (403, 404):
+            print(f"Note: Managed users API returned {response.status_code}.")
+            return None
+        else:
+            print(f"Warning: Managed users API returned {response.status_code}")
+            return None
+
+    return all_users if all_users else None
+
+
+def process_ai_usage_metrics(ai_usage_metrics):
+    """
+    Extract structured data from the /settings/billing/ai_usage_metrics response.
+
+    Handles multiple possible field-name conventions that GitHub may return
+    and produces a normalised dict with:
+      allocated_credits   – total AI credits in the monthly pool
+      consumed_credits    – AI credits consumed so far
+      remaining_credits   – allocated − consumed
+      model_breakdown     – dict of model_name → {"total", "included", "additional"}
+      cost_center_breakdown – dict of center_name → {"credits", "users", "user_count"}
+
+    Returns None when the input is empty or unrecognised.
+    """
+    if not ai_usage_metrics or not isinstance(ai_usage_metrics, dict):
+        return None
+
+    result = {}
+
+    # ── Allocated credits ────────────────────────────────────────────────────
+    for key in ("allocated_credits", "included_credits", "total_allocated_credits",
+                "pooled_credits", "included_ai_credits", "monthly_ai_credits"):
+        val = _coerce_number(ai_usage_metrics.get(key))
+        if val is not None and val >= 0:
+            result["allocated_credits"] = int(val)
+            break
+
+    # ── Consumed credits ─────────────────────────────────────────────────────
+    for key in ("consumed_credits", "used_credits", "total_credits_used",
+                "ai_credits_used", "credits_consumed", "credits_used"):
+        val = _coerce_number(ai_usage_metrics.get(key))
+        if val is not None and val >= 0:
+            result["consumed_credits"] = val
+            break
+
+    # ── Remaining credits (computed or API-provided) ─────────────────────────
+    for key in ("remaining_credits", "available_credits", "credits_remaining"):
+        val = _coerce_number(ai_usage_metrics.get(key))
+        if val is not None and val >= 0:
+            result["remaining_credits"] = val
+            break
+    if "remaining_credits" not in result:
+        alloc = result.get("allocated_credits")
+        consumed = result.get("consumed_credits")
+        if alloc is not None and consumed is not None:
+            result["remaining_credits"] = max(0.0, alloc - consumed)
+
+    # ── Model breakdown ──────────────────────────────────────────────────────
+    models_raw = (ai_usage_metrics.get("models") or
+                  ai_usage_metrics.get("model_breakdown") or
+                  ai_usage_metrics.get("by_model") or [])
+    if isinstance(models_raw, list) and models_raw:
+        model_breakdown = {}
+        for m in models_raw:
+            if not isinstance(m, dict):
+                continue
+            name = (m.get("name") or m.get("model_name") or m.get("model") or "Unknown")
+            credits = _coerce_number(
+                m.get("credits_used") or m.get("total_credits") or
+                m.get("included_credits") or 0
+            ) or 0.0
+            add_credits = _coerce_number(m.get("additional_credits") or 0) or 0.0
+            model_breakdown[name] = {
+                "total": credits + add_credits,
+                "included": credits,
+                "additional": add_credits,
+            }
+        if model_breakdown:
+            result["model_breakdown"] = model_breakdown
+
+    # ── Cost center breakdown ────────────────────────────────────────────────
+    centers_raw = (ai_usage_metrics.get("cost_centers") or
+                   ai_usage_metrics.get("by_cost_center") or
+                   ai_usage_metrics.get("cost_center_breakdown") or [])
+    if isinstance(centers_raw, list) and centers_raw:
+        cc_breakdown = {}
+        for cc in centers_raw:
+            if not isinstance(cc, dict):
+                continue
+            name = (cc.get("name") or cc.get("cost_center") or
+                    cc.get("cost_center_name") or "Unknown")
+            credits = _coerce_number(
+                cc.get("credits_used") or cc.get("total_credits") or
+                cc.get("credits") or 0
+            ) or 0.0
+            users_raw = cc.get("users") or cc.get("user_count") or 0
+            user_count = (len(users_raw) if isinstance(users_raw, list)
+                          else int(_coerce_number(users_raw) or 0))
+            cc_breakdown[name] = {
+                "credits": credits,
+                "users": set(),
+                "user_count": user_count,
+            }
+        if cc_breakdown:
+            result["cost_center_breakdown"] = cc_breakdown
+
+    return result if result else None
+
+
 def generate_report(report_data, billing_data, month_name,
                     seats_data=None, billing_start_date=None, is_current_month=False):
     """
-    Generate the usage report as a formatted string and CSV.
+    Generate the usage report as a formatted string, CSV, and JSON.
 
     Args:
         report_data:          Aggregated metrics (total_credits, unique_users, breakdowns).
@@ -1629,6 +1865,9 @@ def generate_report(report_data, billing_data, month_name,
                               The Copilot billing API only returns live data for the
                               current cycle; for historical months its included_ai_credits
                               field reflects the current seat count, not the historical one.
+
+    Returns:
+        Tuple of (report_text, csv_text, json_text).
     """
     total_credits = report_data["total_credits"]
     unique_users = report_data["unique_users"]
@@ -1733,6 +1972,12 @@ def generate_report(report_data, billing_data, month_name,
               "No seats data available and the billing API did not return "
               "plan_type / seat_breakdown data.")
 
+    # Compute remaining credits when both allocated and consumed are known.
+    if pooled_credits != "N/A":
+        remaining_credits = max(0, pooled_credits - total_credits)
+    else:
+        remaining_credits = "N/A"
+
     report_lines = []
     report_lines.append(f"GitHub Copilot USAGE SUMMARY REPORT - {month_name.upper()}")
     report_lines.append("=" * 60)
@@ -1740,10 +1985,14 @@ def generate_report(report_data, billing_data, month_name,
     report_lines.append("OVERALL METRICS")
     report_lines.append("-" * 40)
     if pooled_credits != "N/A":
-        report_lines.append(f"  Pooled Credits (Allocated): {pooled_credits:,}")
+        report_lines.append(f"  Allocated Credits:         {pooled_credits:,}")
     else:
-        report_lines.append(f"  Pooled Credits (Allocated): {pooled_credits}")
-    report_lines.append(f"  Total AI Credits Used:   {total_credits:,.2f}")
+        report_lines.append(f"  Allocated Credits:         {pooled_credits}")
+    report_lines.append(f"  Consumed Credits:          {total_credits:,.2f}")
+    if remaining_credits != "N/A":
+        report_lines.append(f"  Remaining Credits:         {remaining_credits:,.2f}")
+    else:
+        report_lines.append(f"  Remaining Credits:         {remaining_credits}")
     report_lines.append(f"  Total Users (Licensed):    {unique_users:,}")
     report_lines.append("")
     report_lines.append("")
@@ -1835,8 +2084,11 @@ def generate_report(report_data, billing_data, month_name,
     writer.writerow(["GitHub Copilot USAGE SUMMARY REPORT", month_name.upper()])
     writer.writerow([])
     writer.writerow(["OVERALL METRICS"])
-    writer.writerow(["Pooled Credits (Allocated)", pooled_credits])
-    writer.writerow(["Total AI Credits Used", f"{total_credits:.2f}"])
+    writer.writerow(["Allocated Credits", pooled_credits])
+    writer.writerow(["Consumed Credits", f"{total_credits:.2f}"])
+    writer.writerow(["Remaining Credits",
+                      f"{remaining_credits:.2f}" if remaining_credits != "N/A"
+                      else remaining_credits])
     writer.writerow(["Total Users (Licensed)", unique_users])
     writer.writerow([])
 
@@ -1875,7 +2127,44 @@ def generate_report(report_data, billing_data, month_name,
 
     csv_text = csv_output.getvalue()
 
-    return report_text, csv_text
+    # Generate JSON
+    json_report = {
+        "report_month": month_name,
+        "generated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "overall_metrics": {
+            "allocated_credits": pooled_credits if pooled_credits != "N/A" else None,
+            "consumed_credits": round(total_credits, 2),
+            "remaining_credits": (round(remaining_credits, 2)
+                                  if remaining_credits != "N/A" else None),
+            "total_licensed_users": unique_users,
+        },
+        "cost_center_breakdown": [
+            {
+                "cost_center": center,
+                "total_ai_credits": round(data["credits"], 2),
+                "users": _get_user_count(data),
+            }
+            for center, data in sorted_centers
+        ],
+        "model_breakdown": [],
+    }
+    for model_name, model_data, total in sorted_models:
+        if isinstance(model_data, dict):
+            json_report["model_breakdown"].append({
+                "model": model_name,
+                "included_credits": round(model_data.get("included", 0.0), 2),
+                "additional_credits": round(model_data.get("additional", 0.0), 2),
+                "total_credits": round(total, 2),
+            })
+        else:
+            json_report["model_breakdown"].append({
+                "model": model_name,
+                "total_credits": round(total, 2),
+            })
+
+    json_text = json.dumps(json_report, indent=2)
+
+    return report_text, csv_text, json_text
 
 
 def main():
@@ -1964,6 +2253,31 @@ def main():
     print("Fetching cost centers...")
     cost_centers = fetch_cost_centers(enterprise, token)
 
+    # 1i. AI usage endpoint → allocated/consumed/remaining credits + breakdowns
+    print("Fetching AI usage data...")
+    ai_usage_data = fetch_ai_usage(
+        enterprise, token, start_date, end_date,
+        group_by="models",
+    )
+    # Also fetch grouped by cost_center to get cost-center breakdown
+    ai_usage_by_cc = fetch_ai_usage(
+        enterprise, token, start_date, end_date,
+        group_by="cost_center",
+    )
+
+    # 1j. AI usage metrics endpoint → full metrics by month (models + cost centers)
+    print("Fetching AI usage metrics...")
+    ai_usage_metrics_data = fetch_ai_usage_metrics(
+        enterprise, token, year, month,
+        group_by="models",
+    )
+
+    # 1k. Managed users → total enterprise user count (fallback)
+    print("Fetching managed users...")
+    managed_users_data = fetch_managed_users(enterprise, token)
+    if managed_users_data is not None:
+        print(f"  Managed users API: {len(managed_users_data)} enterprise members")
+
     print()
 
     # ── Step 2: Process all data sources ──────────────────────────────────────
@@ -1982,6 +2296,25 @@ def main():
     if metrics_source:
         print("Processing enterprise-level metrics data...")
         metrics_processed = process_metrics_data(metrics_source)
+
+    # Process AI usage metrics (new endpoint – allocated/consumed/remaining + breakdowns)
+    ai_metrics_processed = None
+    if ai_usage_metrics_data:
+        print("Processing AI usage metrics data...")
+        ai_metrics_processed = process_ai_usage_metrics(ai_usage_metrics_data)
+        if ai_metrics_processed:
+            print(f"  AI usage metrics: "
+                  f"allocated={ai_metrics_processed.get('allocated_credits')}, "
+                  f"consumed={ai_metrics_processed.get('consumed_credits')}, "
+                  f"remaining={ai_metrics_processed.get('remaining_credits')}")
+
+    # Also try to process the ai_usage endpoint response with process_ai_usage_metrics
+    # (it may return the same structure as ai_usage_metrics)
+    ai_usage_processed = None
+    if ai_usage_data and not ai_metrics_processed:
+        ai_usage_processed = process_ai_usage_metrics(
+            ai_usage_data if isinstance(ai_usage_data, dict) else {}
+        )
 
     # Process billing usage (cost-center labels, included/additional breakdown)
     billing_usage_processed = process_billing_usage_data(billing_usage, cost_centers)
@@ -2034,12 +2367,20 @@ def main():
     model_breakdown = {}
     cost_center_breakdown = {}
 
-    # Consumed credits — Copilot billing API (current month) or per-user sum.
+    # Consumed credits priority:
+    #   1. Copilot billing API (current month, exact match to UI)
+    #   2. AI usage metrics endpoint (new API, if available)
+    #   3. Per-user metrics sum (historical months)
+    #   4. Billing usage-summary API
     if is_current_month and billing_data:
         billing_consumed = extract_consumed_credits_from_billing(billing_data)
         if billing_consumed is not None:
             total_credits = billing_consumed
             print(f"  Consumed credits from Copilot billing API (current cycle): {total_credits:,}")
+
+    if total_credits == 0 and ai_metrics_processed and ai_metrics_processed.get("consumed_credits"):
+        total_credits = ai_metrics_processed["consumed_credits"]
+        print(f"  Consumed credits from AI usage metrics API: {total_credits:,.2f}")
 
     if total_credits == 0 and per_user_processed and per_user_processed["total_credits"] > 0:
         total_credits = per_user_processed["total_credits"]
@@ -2055,11 +2396,11 @@ def main():
         print("  Ensure the token has 'manage_billing:copilot' scope and that there "
               "is Copilot usage for the selected month.")
 
-    # User count: total licensed seats is the authoritative value.
-    # seat_breakdown.total from the billing API matches the "billable licenses"
-    # count on the GitHub Copilot management page (e.g. 19 billable licenses).
-    # The seats-list API may return fewer entries when it only enumerates
-    # individually provisioned seats and misses enterprise-level grants.
+    # User count priority:
+    #   1. Copilot billing API seat_breakdown.total (authoritative)
+    #   2. Copilot seats list (deduplicated logins)
+    #   3. Per-user metrics active count
+    #   4. Managed users API total count (fallback)
     billing_total_seats = extract_total_licensed_seats(billing_data) if billing_data else None
     if billing_total_seats and billing_total_seats > 0:
         unique_users = billing_total_seats
@@ -2070,11 +2411,19 @@ def main():
     elif per_user_processed and per_user_processed["unique_users"] > 0:
         unique_users = per_user_processed["unique_users"]
         print("  Note: Using active user count from per-user metrics (seats API unavailable).")
+    elif managed_users_data is not None:
+        unique_users = len(managed_users_data)
+        print(f"  Total licensed users from managed users API: {unique_users}")
 
-    # Model breakdown: prefer metrics API (has named models) over billing usage
-    # (which typically returns 'Unknown Model' for AI-credit line items).
+    # Model breakdown priority:
+    #   1. Enterprise metrics API (has named models)
+    #   2. AI usage metrics API model breakdown
+    #   3. Billing usage model breakdown (named models only)
     if metrics_processed and metrics_processed.get("model_breakdown"):
         model_breakdown = metrics_processed["model_breakdown"]
+    elif ai_metrics_processed and ai_metrics_processed.get("model_breakdown"):
+        model_breakdown = ai_metrics_processed["model_breakdown"]
+        print("  Model breakdown from AI usage metrics API.")
     elif billing_usage_processed and billing_usage_processed.get("model_breakdown"):
         billing_models = billing_usage_processed["model_breakdown"]
         if _has_named_models(billing_models):
@@ -2082,13 +2431,17 @@ def main():
 
     # Cost center breakdown priority:
     #   1. Usage summary API (aggregated, most efficient, has proper cost center names)
-    #   2. Per-user data re-attributed via user_cost_center_map (accurate credits)
-    #   3. Per-user org breakdown (fallback when no cost center mapping available)
-    #   4. Billing usage line items (cost-center labels present but credit values unreliable)
-    #   5. Org metrics (last resort)
+    #   2. AI usage metrics API cost-center breakdown
+    #   3. Per-user data re-attributed via user_cost_center_map (accurate credits)
+    #   4. Per-user org breakdown (fallback when no cost center mapping available)
+    #   5. Billing usage line items (cost-center labels present but credit values unreliable)
+    #   6. Org metrics (last resort)
     if usage_summary_processed and usage_summary_processed.get("cost_center_breakdown"):
         cost_center_breakdown = usage_summary_processed["cost_center_breakdown"]
         print("  Cost center breakdown from billing usage-summary API.")
+    elif ai_metrics_processed and ai_metrics_processed.get("cost_center_breakdown"):
+        cost_center_breakdown = ai_metrics_processed["cost_center_breakdown"]
+        print("  Cost center breakdown from AI usage metrics API.")
     elif user_cost_center_map and per_user_processed and per_user_processed.get("user_credits"):
         # Re-attribute per-user credits to cost centers using the cost center map
         print("  Building cost-center breakdown from per-user credits + cost center map...")
@@ -2121,7 +2474,7 @@ def main():
     }
 
     # Generate the report
-    report_text, csv_text = generate_report(
+    report_text, csv_text, json_text = generate_report(
         report_data, billing_data, month_name, seats_data,
         billing_start_date=start_date,
         is_current_month=is_current_month
@@ -2135,6 +2488,7 @@ def main():
     os.makedirs("reports", exist_ok=True)
     report_filename = f"reports/copilot_usage_report_{start_date.strftime('%Y_%m')}.txt"
     csv_filename = f"reports/copilot_usage_report_{start_date.strftime('%Y_%m')}.csv"
+    json_filename = f"reports/copilot_usage_report_{start_date.strftime('%Y_%m')}.json"
 
     with open(report_filename, "w") as f:
         f.write(report_text)
@@ -2142,8 +2496,12 @@ def main():
     with open(csv_filename, "w") as f:
         f.write(csv_text)
 
+    with open(json_filename, "w") as f:
+        f.write(json_text)
+
     print(f"\nReport saved to: {report_filename}")
     print(f"CSV saved to: {csv_filename}")
+    print(f"JSON saved to: {json_filename}")
 
     # Set output for GitHub Actions
     github_output = os.environ.get("GITHUB_OUTPUT")
@@ -2151,6 +2509,7 @@ def main():
         with open(github_output, "a") as f:
             f.write(f"report_file={report_filename}\n")
             f.write(f"csv_file={csv_filename}\n")
+            f.write(f"json_file={json_filename}\n")
             f.write(f"month_name={month_name}\n")
 
     # Also set the report as step summary

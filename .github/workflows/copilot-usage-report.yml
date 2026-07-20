@@ -85,4 +85,4 @@ jobs:
 
             Regards,
             GitHub Actions Bot
-          attachments: reports/*.csv
+          attachments: reports/*.csv,reports/*.json
