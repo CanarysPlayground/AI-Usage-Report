@@ -2355,6 +2355,50 @@ def main():
             ai_usage_data if isinstance(ai_usage_data, dict) else {}
         )
 
+    # Process AI usage grouped by cost center.
+    # ai_usage_by_cc is always fetched (step 1i) but was previously never consumed —
+    # this block extracts its cost-center breakdown so it can feed the priority chain.
+    ai_usage_cc_processed = None
+    if ai_usage_by_cc:
+        if isinstance(ai_usage_by_cc, dict):
+            ai_usage_cc_processed = process_ai_usage_metrics(ai_usage_by_cc)
+        elif isinstance(ai_usage_by_cc, list):
+            # Some API versions return a bare list of cost-center records.
+            cc_breakdown = {}
+            total_cc_credits = 0.0
+            for item in ai_usage_by_cc:
+                if not isinstance(item, dict):
+                    continue
+                name = (item.get("cost_center") or item.get("name") or
+                        item.get("cost_center_name") or "Not Assigned")
+                credits = _find_first_valid_number(
+                    item, ("credits_used", "total_credits", "credits",
+                           "included_credits", "quantity")
+                )
+                add_credits_raw = _coerce_number(item.get("additional_credits"))
+                add_credits = add_credits_raw if add_credits_raw is not None else 0.0
+                users_raw = item.get("users") or item.get("user_count") or 0
+                user_count = (len(users_raw) if isinstance(users_raw, list)
+                              else round(_coerce_number(users_raw) or 0))
+                cc_breakdown[name] = {
+                    "credits": credits + add_credits,
+                    # users set is left empty here; _enrich_cost_center_users()
+                    # can populate it later if per-user data is available.
+                    "users": set(),
+                    "user_count": user_count,
+                }
+                total_cc_credits += credits + add_credits
+            if cc_breakdown:
+                ai_usage_cc_processed = {
+                    "cost_center_breakdown": cc_breakdown,
+                    "consumed_credits": total_cc_credits,
+                }
+        if ai_usage_cc_processed:
+            cc_consumed = ai_usage_cc_processed.get("consumed_credits")
+            cc_centers = ai_usage_cc_processed.get("cost_center_breakdown") or {}
+            print(f"  AI usage (cost center grouping): consumed={cc_consumed}, "
+                  f"{len(cc_centers)} cost center(s)")
+
     # Process billing usage (cost-center labels, included/additional breakdown)
     billing_usage_processed = process_billing_usage_data(billing_usage, cost_centers)
 
@@ -2410,6 +2454,10 @@ def main():
     #   2. AI usage metrics endpoint (new API, if available)
     #   3. Per-user metrics sum (historical months)
     #   4. Billing usage-summary API
+    #   5. AI usage (cost center grouping) total — ai_usage_by_cc was fetched for
+    #      cost-center attribution; its total also gives us consumed credits.
+    #   6. Sum of model breakdown from AI usage metrics (if endpoint returned model
+    #      list but omitted a top-level consumed_credits field)
     # We use None as a sentinel so that a genuine 0-credit result is not confused
     # with "no data found".
     if is_current_month and billing_data:
@@ -2432,6 +2480,26 @@ def main():
     if total_credits is None and usage_summary_processed and usage_summary_processed["total_credits"] > 0:
         total_credits = usage_summary_processed["total_credits"]
         print(f"  Consumed credits from billing usage-summary API: {total_credits:,.2f}")
+
+    # Step 5: use the total derived from ai_usage_by_cc (cost-center grouping).
+    if total_credits is None and ai_usage_cc_processed:
+        cc_consumed = ai_usage_cc_processed.get("consumed_credits")
+        if cc_consumed is not None and cc_consumed > 0:
+            total_credits = cc_consumed
+            print(f"  Consumed credits from AI usage (cost center grouping): "
+                  f"{total_credits:,.2f}")
+
+    # Step 6: sum model breakdown totals when the AI usage metrics endpoint returned
+    # model-level data but omitted an explicit top-level consumed_credits field.
+    if total_credits is None and ai_metrics_processed and ai_metrics_processed.get("model_breakdown"):
+        model_sum = sum(
+            (v.get("total", 0) if isinstance(v, dict) else float(v or 0))
+            for v in ai_metrics_processed["model_breakdown"].values()
+        )
+        if model_sum > 0:
+            total_credits = model_sum
+            print(f"  Consumed credits from AI usage metrics model breakdown sum: "
+                  f"{total_credits:,.2f}")
 
     if total_credits is None:
         print("  Warning: Could not determine consumed AI credits.")
@@ -2465,32 +2533,38 @@ def main():
         print(f"  Total licensed users from managed users API: {unique_users}")
 
     # Model breakdown priority:
-    #   1. Enterprise metrics API (has named models)
-    #   2. AI usage metrics API model breakdown
-    #   3. Billing usage model breakdown (named models only)
-    if metrics_processed and metrics_processed.get("model_breakdown"):
-        model_breakdown = metrics_processed["model_breakdown"]
-    elif ai_metrics_processed and ai_metrics_processed.get("model_breakdown"):
+    #   1. AI usage metrics API (AI-credit-based with included/additional breakdown)
+    #   2. Billing usage line items (AI-credit-based with included/additional breakdown)
+    #   3. Enterprise metrics API (last resort — legacy token-count values, not AI credits;
+    #      values are plain floats so the report cannot show an included/additional split)
+    if ai_metrics_processed and ai_metrics_processed.get("model_breakdown"):
         model_breakdown = ai_metrics_processed["model_breakdown"]
         print("  Model breakdown from AI usage metrics API.")
     elif billing_usage_processed and billing_usage_processed.get("model_breakdown"):
         billing_models = billing_usage_processed["model_breakdown"]
         if _has_named_models(billing_models):
             model_breakdown = billing_models
+    elif metrics_processed and metrics_processed.get("model_breakdown"):
+        model_breakdown = metrics_processed["model_breakdown"]
 
     # Cost center breakdown priority:
     #   1. Usage summary API (aggregated, most efficient, has proper cost center names)
     #   2. AI usage metrics API cost-center breakdown
-    #   3. Per-user data re-attributed via user_cost_center_map (accurate credits)
-    #   4. Per-user org breakdown (fallback when no cost center mapping available)
-    #   5. Billing usage line items (cost-center labels present but credit values unreliable)
-    #   6. Org metrics (last resort)
+    #   3. AI usage endpoint grouped by cost_center (ai_usage_by_cc — always fetched,
+    #      was previously unused; now the processed result feeds this priority step)
+    #   4. Per-user data re-attributed via user_cost_center_map (accurate credits)
+    #   5. Per-user org breakdown (fallback when no cost center mapping available)
+    #   6. Billing usage line items (cost-center labels present but credit values unreliable)
+    #   7. Org metrics (last resort)
     if usage_summary_processed and usage_summary_processed.get("cost_center_breakdown"):
         cost_center_breakdown = usage_summary_processed["cost_center_breakdown"]
         print("  Cost center breakdown from billing usage-summary API.")
     elif ai_metrics_processed and ai_metrics_processed.get("cost_center_breakdown"):
         cost_center_breakdown = ai_metrics_processed["cost_center_breakdown"]
         print("  Cost center breakdown from AI usage metrics API.")
+    elif ai_usage_cc_processed and ai_usage_cc_processed.get("cost_center_breakdown"):
+        cost_center_breakdown = ai_usage_cc_processed["cost_center_breakdown"]
+        print("  Cost center breakdown from AI usage endpoint (group_by=cost_center).")
     elif user_cost_center_map and per_user_processed and per_user_processed.get("user_credits"):
         # Re-attribute per-user credits to cost centers using the cost center map
         print("  Building cost-center breakdown from per-user credits + cost center map...")
