@@ -2258,8 +2258,8 @@ def main():
     # 1b. Copilot seat assignments → accurate licensed user count
     print("Fetching Copilot seat assignments...")
     _seats_result = fetch_copilot_seats(enterprise, token)
-    seats_data = _seats_result["seats"] if _seats_result else None
-    seats_api_total = _seats_result["total_seats"] if _seats_result else None
+    seats_data = _seats_result.get("seats") if _seats_result else None
+    seats_api_total = _seats_result.get("total_seats") if _seats_result else None
 
     # 1c. Per-user metrics (new API, June 2026+) → ai_credits_used per user
     print("Fetching per-user Copilot metrics...")
