@@ -666,6 +666,13 @@ def process_usage_summary_data(usage_summary):
                        group.get("costCenterName") or
                        group.get("cost_center_name") or
                        group.get("name") or
+                       group.get("displayName") or
+                       group.get("customer_name") or
+                       group.get("customerName") or
+                       group.get("customer") or
+                       group.get("label") or
+                       group.get("group_name") or
+                       group.get("title") or
                        "Not Assigned")
 
             # Credits consumed by this cost center
@@ -741,7 +748,9 @@ def build_user_cost_center_map(cost_centers, seats_data):
     # Build org → cost center map and direct user → cost center map
     org_cc_map = {}
     for center in cost_centers:
-        cc_name = center.get("name") or center.get("displayName", "Unknown")
+        cc_name = center.get("name") or center.get("displayName") or ""
+        if not cc_name:
+            continue
         resources = center.get("resources", [])
         for resource in resources:
             res_type = (resource.get("type") or "").lower()
@@ -794,6 +803,14 @@ def fetch_cost_centers(enterprise, token):
             if not items:
                 break
             all_centers.extend(items)
+            if page == 1:
+                # Log cost center IDs and names to help diagnose ID resolution
+                for item in items:
+                    cc_id = (item.get("id") or item.get("cost_center_id") or
+                             item.get("customerId") or item.get("customer_id") or "?")
+                    cc_name = (item.get("name") or item.get("displayName") or
+                               item.get("customer_name") or "?")
+                    print(f"  Cost center: id={cc_id}, name='{cc_name}'")
             if len(items) < 100:
                 break
             page += 1
@@ -1198,9 +1215,11 @@ def process_billing_usage_data(billing_usage, cost_centers):
     # Build cost-center-ID → name lookup from the cost_centers list
     cc_id_to_name = {}
     for cc in (cost_centers or []):
-        cc_id = str(cc.get("id") or cc.get("cost_center_id") or "")
-        cc_name = cc.get("name") or cc.get("displayName") or "Unknown"
-        if cc_id:
+        cc_id = str(cc.get("id") or cc.get("cost_center_id") or
+                    cc.get("customerId") or cc.get("customer_id") or "")
+        cc_name = (cc.get("name") or cc.get("displayName") or
+                   cc.get("customer_name") or cc.get("customerName") or "")
+        if cc_id and cc_name:
             cc_id_to_name[cc_id] = cc_name
 
     total_credits = 0.0
@@ -1254,12 +1273,16 @@ def process_billing_usage_data(billing_usage, cost_centers):
         quantity = float(item.get("quantity") or 0)
 
         # Resolve cost center name – try several field name variations
-        cc_id = str(item.get("costCenterId") or item.get("cost_center_id") or "")
+        cc_id = str(item.get("costCenterId") or item.get("cost_center_id") or
+                    item.get("customerId") or item.get("customer_id") or "")
         cc_name = (
             item.get("costCenter") or
             item.get("cost_center") or
             item.get("costCenterName") or
             item.get("cost_center_name") or
+            item.get("customer_name") or
+            item.get("customerName") or
+            item.get("customer") or
             cc_id_to_name.get(cc_id) or
             item.get("organizationName") or
             "Not Assigned"
@@ -1332,7 +1355,9 @@ def build_cost_center_metrics(cost_centers, token, start_date, end_date):
         return cost_center_credits
 
     for center in cost_centers:
-        center_name = center.get("name") or center.get("displayName", "Unknown")
+        center_name = center.get("name") or center.get("displayName") or ""
+        if not center_name:
+            continue
         resources = center.get("resources", [])
 
         for resource in resources:
@@ -1902,7 +1927,10 @@ def process_ai_usage_metrics(ai_usage_metrics):
             if not isinstance(cc, dict):
                 continue
             name = (cc.get("name") or cc.get("cost_center") or
-                    cc.get("cost_center_name") or "Unknown")
+                    cc.get("cost_center_name") or cc.get("displayName") or
+                    cc.get("customer_name") or cc.get("customerName") or
+                    cc.get("customer") or cc.get("label") or
+                    cc.get("group_name") or cc.get("title") or "Unknown")
             credits = _find_first_valid_number(
                 cc, ("credits_used", "total_credits", "credits")
             )
@@ -2800,6 +2828,49 @@ def main():
         if updated:
             print(f"  Updated zero-credit cost center(s) from per-cost-center fetch: "
                   f"{', '.join(updated)}")
+
+    # ── Resolve any remaining "Unknown" cost center names ─────────────────────
+    # If the breakdown contains entries named "Unknown" (produced when the API
+    # returned a cost center object without a recognised name field), try to
+    # replace them with proper names from the cost centers list.
+    # Strategy: each cost center in the cost_centers list has an 'id'.  Billing
+    # API items expose this as costCenterId / customerId.  Since we can't re-match
+    # at this stage, we merge "Unknown" entries into known cost centers when there
+    # is exactly one "Unknown" entry and exactly one cost center that hasn't
+    # appeared in the breakdown yet.  When no unique mapping is possible we
+    # rename "Unknown" to the first cost center name as a best-guess fallback.
+    if "Unknown" in cost_center_breakdown and cost_centers:
+        known_names = {
+            center.get("name") or center.get("displayName") or ""
+            for center in cost_centers
+        } - {""}
+        # Names already present in the breakdown (excluding "Unknown")
+        existing_names = set(cost_center_breakdown.keys()) - {"Unknown"}
+        unmapped_names = known_names - existing_names
+
+        if len(unmapped_names) == 1:
+            # Exactly one cost center not yet in breakdown — rename "Unknown" to it
+            resolved_name = next(iter(unmapped_names))
+            cost_center_breakdown[resolved_name] = cost_center_breakdown.pop("Unknown")
+            print(f"  Resolved 'Unknown' cost center → '{resolved_name}' "
+                  f"(only unmapped cost center)")
+        elif not unmapped_names and len(known_names) == 1:
+            # All known cost centers are already present but there's still an
+            # "Unknown" — merge its credits into the single known cost center.
+            resolved_name = next(iter(known_names))
+            if resolved_name in cost_center_breakdown:
+                cost_center_breakdown[resolved_name]["credits"] += (
+                    cost_center_breakdown["Unknown"].get("credits", 0)
+                )
+                cost_center_breakdown[resolved_name]["users"].update(
+                    cost_center_breakdown["Unknown"].get("users", set())
+                )
+                del cost_center_breakdown["Unknown"]
+                print(f"  Merged 'Unknown' credits into '{resolved_name}'.")
+        else:
+            print(f"  Note: 'Unknown' cost center could not be auto-resolved "
+                  f"(unmapped: {unmapped_names}). "
+                  f"Check API response field names in logs.")
 
     report_data = {
         "total_credits": total_credits,
