@@ -2369,12 +2369,12 @@ def main():
         if ai_usage_metrics_cc_processed:
             cc_consumed = ai_usage_metrics_cc_processed.get("consumed_credits")
             cc_centers = ai_usage_metrics_cc_processed.get("cost_center_breakdown") or {}
-            if cc_consumed is not None:
+            if cc_consumed is not None and cc_consumed > 0:
                 print(f"  AI usage metrics (cost center grouping): consumed={cc_consumed}, "
                       f"{len(cc_centers)} cost center(s)")
             else:
                 print(f"  AI usage metrics (cost center grouping): {len(cc_centers)} cost center(s) "
-                      f"(consumed credits not available)")
+                      f"(consumed credits: {cc_consumed if cc_consumed is not None else 'not available'})")
 
     # Process AI usage grouped by cost center.
     # ai_usage_by_cc is always fetched (step 1i) but was previously never consumed —
