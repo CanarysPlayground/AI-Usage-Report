@@ -1014,6 +1014,10 @@ def process_metrics_data(metrics_data):
     Process metrics API data for detailed breakdowns.
     Extracts unique users from total_active_users and supports both
     total_credits_consumed (newer API) and total_ai_tokens (proxy) fields.
+
+    Sets ``has_credit_values`` to True when at least one record contained a
+    ``total_credits_consumed`` field, indicating the totals are genuine AI
+    credits rather than raw token counts.
     """
     total_credits = 0
     cost_center_credits = defaultdict(lambda: {"credits": 0, "users": set()})
@@ -1023,6 +1027,9 @@ def process_metrics_data(metrics_data):
     # monthly unique users. This will undercount if different users are active on
     # different days, but is the best approximation available from the aggregate API.
     unique_users_max = 0
+    # True when total_credits_consumed was present in at least one record — this
+    # indicates the returned values are genuine AI credits, not raw token counts.
+    has_credit_values = False
 
     for day_data in metrics_data:
         daily_users = day_data.get("total_active_users", 0) or 0
@@ -1044,6 +1051,8 @@ def process_metrics_data(metrics_data):
                         # Fall back to total_ai_tokens only if credits field is absent —
                         # both represent consumption units from the same model response and
                         # are used as proxies when the billing credit field is unavailable.
+                        if "total_credits_consumed" in lang:
+                            has_credit_values = True
                         credits = (lang.get("total_credits_consumed") or
                                    lang.get("total_ai_tokens") or 0)
                         total_credits += credits
@@ -1055,6 +1064,8 @@ def process_metrics_data(metrics_data):
                 for model_data in editor_data.get("models", []):
                     model_name = model_data.get("name", "Unknown")
                     # Same preference: credits > tokens > 0
+                    if "total_credits_consumed" in model_data:
+                        has_credit_values = True
                     credits = (model_data.get("total_credits_consumed") or
                                model_data.get("total_ai_tokens") or 0)
                     total_credits += credits
@@ -1064,6 +1075,8 @@ def process_metrics_data(metrics_data):
         if copilot_dotcom_chat:
             for model_data in copilot_dotcom_chat.get("models", []):
                 model_name = model_data.get("name", "Unknown")
+                if "total_credits_consumed" in model_data:
+                    has_credit_values = True
                 credits = (model_data.get("total_credits_consumed") or
                            model_data.get("total_ai_tokens") or 0)
                 total_credits += credits
@@ -1073,6 +1086,8 @@ def process_metrics_data(metrics_data):
         if copilot_dotcom_pull_requests:
             for model_data in copilot_dotcom_pull_requests.get("models", []):
                 model_name = model_data.get("name", "Unknown")
+                if "total_credits_consumed" in model_data:
+                    has_credit_values = True
                 credits = (model_data.get("total_credits_consumed") or
                            model_data.get("total_ai_tokens") or 0)
                 total_credits += credits
@@ -1082,7 +1097,8 @@ def process_metrics_data(metrics_data):
         "total_credits": total_credits,
         "unique_users": unique_users_max,
         "cost_center_breakdown": cost_center_credits,
-        "model_breakdown": model_credits
+        "model_breakdown": model_credits,
+        "has_credit_values": has_credit_values,
     }
 
 
@@ -1100,6 +1116,7 @@ def process_per_user_metrics(user_metrics_data, seats_data=None):
     unique_users = set()
     user_credits_map = defaultdict(float)
     org_credits = defaultdict(lambda: {"credits": 0.0, "users": set()})
+    model_credits = defaultdict(float)
 
     # Build user → org mapping from seats data
     user_org_map = {}
@@ -1115,14 +1132,36 @@ def process_per_user_metrics(user_metrics_data, seats_data=None):
 
     for record in user_metrics_data:
         username = _extract_username(record)
-        credits = float(record.get("ai_credits_used", 0) or 0)
+        # Try multiple field names – the exact name varies by API version and
+        # response format.  ai_credits_used is the canonical June-2026+ name;
+        # the others are alternative names seen in some response formats.
+        raw_credits = (
+            record.get("ai_credits_used") or
+            record.get("credits") or
+            record.get("premium_requests") or
+            record.get("credits_used") or
+            record.get("total_credits_used") or
+            record.get("total_credits") or
+            0
+        )
+        credits = float(raw_credits or 0)
         org = record.get("organization") or user_org_map.get(username, "Not Assigned")
+
+        # Extract model name if the per-user record includes it.
+        model_name = (
+            record.get("model_name") or
+            record.get("model") or
+            record.get("modelName") or
+            ""
+        )
 
         unique_users.add(username)
         user_credits_map[username] += credits
         total_credits += credits
         org_credits[org]["credits"] += credits
         org_credits[org]["users"].add(username)
+        if model_name and credits > 0:
+            model_credits[model_name] += credits
 
     return {
         "total_credits": total_credits,
@@ -1130,7 +1169,7 @@ def process_per_user_metrics(user_metrics_data, seats_data=None):
         "user_credits": dict(user_credits_map),
         "org_breakdown": dict(org_credits),
         "cost_center_breakdown": {},
-        "model_breakdown": {}
+        "model_breakdown": dict(model_credits),
     }
 
 
@@ -2273,7 +2312,9 @@ def main():
         enterprise, token, start_date, end_date
     )
 
-    # 1e. Legacy enterprise metrics (fallback if new API unavailable)
+    # 1e. Legacy enterprise metrics (fallback if new API unavailable or produced no data)
+    # Always fetched so it can supplement the enterprise-1-day NDJSON results when
+    # those records lack the expected copilot_ide_* structure or credit fields.
     legacy_metrics_data = None
     if enterprise_metrics_data is None:
         print("Fetching enterprise Copilot metrics (legacy)...")
@@ -2342,6 +2383,25 @@ def main():
     if metrics_source:
         print("Processing enterprise-level metrics data...")
         metrics_processed = process_metrics_data(metrics_source)
+
+    # If enterprise-1-day NDJSON produced no model data or no AI-credit values,
+    # supplement with the legacy /copilot/metrics endpoint which uses a well-known
+    # format.  This covers the case where the new reports API returns records with
+    # a different structure that process_metrics_data cannot parse.
+    if (enterprise_metrics_data and not legacy_metrics_data and
+            metrics_processed is not None and
+            not metrics_processed.get("model_breakdown") and
+            not metrics_processed.get("has_credit_values")):
+        print("Fetching enterprise Copilot metrics (legacy supplement)...")
+        legacy_metrics_data = fetch_copilot_org_report(
+            enterprise, token, start_date, end_date
+        )
+        if legacy_metrics_data:
+            legacy_processed = process_metrics_data(legacy_metrics_data)
+            if legacy_processed and (legacy_processed.get("model_breakdown") or
+                                     legacy_processed.get("has_credit_values")):
+                metrics_processed = legacy_processed
+                print("  Switched to legacy metrics: better model/credit data found.")
 
     # Process AI usage metrics (new endpoint – allocated/consumed/remaining + breakdowns)
     ai_metrics_processed = None
@@ -2530,6 +2590,21 @@ def main():
             print(f"  Consumed credits from AI usage metrics model breakdown sum: "
                   f"{total_credits:,.2f}")
 
+    # Step 8: Enterprise / legacy Copilot metrics API total.
+    # Only used when the API returned genuine AI-credit values
+    # (total_credits_consumed field present), not raw token counts.
+    if total_credits is None and metrics_processed:
+        metrics_total = metrics_processed.get("total_credits", 0) or 0
+        if metrics_total > 0:
+            if metrics_processed.get("has_credit_values"):
+                total_credits = metrics_total
+                print(f"  Consumed credits from enterprise metrics API "
+                      f"(aggregated from total_credits_consumed): {total_credits:,.2f}")
+            else:
+                print(f"  Note: Enterprise metrics returned token counts "
+                      f"({metrics_total:,.0f}) rather than AI credits — "
+                      f"skipping to avoid inflated figures.")
+
     if total_credits is None:
         print("  Warning: Could not determine consumed AI credits.")
         print("  Ensure the token has 'manage_billing:copilot' scope and that there "
@@ -2563,12 +2638,23 @@ def main():
 
     # Model breakdown priority:
     #   1. AI usage metrics API (AI-credit-based with included/additional breakdown)
-    #   2. Billing usage line items (AI-credit-based with included/additional breakdown)
-    #   3. Enterprise metrics API (last resort — legacy token-count values, not AI credits;
+    #   2. Per-user metrics model data (AI-credit-based, extracted from per-user records)
+    #   3. Billing usage line items (AI-credit-based with included/additional breakdown)
+    #   4. Enterprise metrics API (last resort — may be token-count values, not AI credits;
     #      values are plain floats so the report cannot show an included/additional split)
     if ai_metrics_processed and ai_metrics_processed.get("model_breakdown"):
         model_breakdown = ai_metrics_processed["model_breakdown"]
         print("  Model breakdown from AI usage metrics API.")
+    elif per_user_processed and per_user_processed.get("model_breakdown"):
+        pu_models = per_user_processed["model_breakdown"]
+        if _has_named_models(pu_models):
+            # Wrap plain totals in the dict format used by the detailed breakdown path
+            # so the report displays them with proper included/additional columns.
+            model_breakdown = {
+                name: {"total": total, "included": total, "additional": 0.0}
+                for name, total in pu_models.items()
+            }
+            print("  Model breakdown from per-user metrics data.")
     elif billing_usage_processed and billing_usage_processed.get("model_breakdown"):
         billing_models = billing_usage_processed["model_breakdown"]
         if _has_named_models(billing_models):
