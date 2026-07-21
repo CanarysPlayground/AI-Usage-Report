@@ -2313,7 +2313,7 @@ def main():
     )
     # Also fetch grouped by cost_center to get accurate cost-center breakdown
     print("Fetching AI usage metrics (cost centers)...")
-    ai_usage_metrics_by_cc = fetch_ai_usage_metrics(
+    ai_usage_metrics_cost_center_data = fetch_ai_usage_metrics(
         enterprise, token, year, month,
         group_by="cost_center",
     )
@@ -2362,13 +2362,13 @@ def main():
         )
 
     # Process AI usage metrics grouped by cost center (new endpoint with cost_center grouping)
-    ai_usage_metrics_cc_processed = None
-    if ai_usage_metrics_by_cc:
+    ai_usage_metrics_cost_center_processed = None
+    if ai_usage_metrics_cost_center_data:
         print("Processing AI usage metrics (cost center grouping)...")
-        ai_usage_metrics_cc_processed = process_ai_usage_metrics(ai_usage_metrics_by_cc)
-        if ai_usage_metrics_cc_processed:
-            cc_consumed = ai_usage_metrics_cc_processed.get("consumed_credits")
-            cc_centers = ai_usage_metrics_cc_processed.get("cost_center_breakdown") or {}
+        ai_usage_metrics_cost_center_processed = process_ai_usage_metrics(ai_usage_metrics_cost_center_data)
+        if ai_usage_metrics_cost_center_processed:
+            cc_consumed = ai_usage_metrics_cost_center_processed.get("consumed_credits")
+            cc_centers = ai_usage_metrics_cost_center_processed.get("cost_center_breakdown") or {}
             if cc_consumed is not None and cc_consumed > 0:
                 print(f"  AI usage metrics (cost center grouping): consumed={cc_consumed}, "
                       f"{len(cc_centers)} cost center(s)")
@@ -2494,8 +2494,8 @@ def main():
             total_credits = ai_consumed
             print(f"  Consumed credits from AI usage metrics API: {total_credits:,.2f}")
 
-    if total_credits is None and ai_usage_metrics_cc_processed:
-        cc_consumed = ai_usage_metrics_cc_processed.get("consumed_credits")
+    if total_credits is None and ai_usage_metrics_cost_center_processed:
+        cc_consumed = ai_usage_metrics_cost_center_processed.get("consumed_credits")
         if cc_consumed is not None and cc_consumed > 0:
             total_credits = cc_consumed
             print(f"  Consumed credits from AI usage metrics API (cost_center grouping): "
@@ -2589,8 +2589,8 @@ def main():
     if usage_summary_processed and usage_summary_processed.get("cost_center_breakdown"):
         cost_center_breakdown = usage_summary_processed["cost_center_breakdown"]
         print("  Cost center breakdown from billing usage-summary API.")
-    elif ai_usage_metrics_cc_processed and ai_usage_metrics_cc_processed.get("cost_center_breakdown"):
-        cost_center_breakdown = ai_usage_metrics_cc_processed["cost_center_breakdown"]
+    elif ai_usage_metrics_cost_center_processed and ai_usage_metrics_cost_center_processed.get("cost_center_breakdown"):
+        cost_center_breakdown = ai_usage_metrics_cost_center_processed["cost_center_breakdown"]
         print("  Cost center breakdown from AI usage metrics API (cost_center grouping).")
     elif ai_metrics_processed and ai_metrics_processed.get("cost_center_breakdown"):
         cost_center_breakdown = ai_metrics_processed["cost_center_breakdown"]
