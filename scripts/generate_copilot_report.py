@@ -2468,12 +2468,13 @@ def main():
 
     # Consumed credits priority:
     #   1. Copilot billing API (current month, exact match to UI)
-    #   2. AI usage metrics endpoint (new API, if available)
-    #   3. Per-user metrics sum (historical months)
-    #   4. Billing usage-summary API
-    #   5. AI usage (cost center grouping) total — ai_usage_by_cc was fetched for
+    #   2. AI usage metrics endpoint with models grouping (new API, if available)
+    #   3. AI usage metrics endpoint with cost_center grouping (new API, if available)
+    #   4. Per-user metrics sum (historical months)
+    #   5. Billing usage-summary API
+    #   6. AI usage (cost center grouping) total — ai_usage_by_cc was fetched for
     #      cost-center attribution; its total also gives us consumed credits.
-    #   6. Sum of model breakdown from AI usage metrics (if endpoint returned model
+    #   7. Sum of model breakdown from AI usage metrics (if endpoint returned model
     #      list but omitted a top-level consumed_credits field)
     # We use None as a sentinel so that a genuine 0-credit result is not confused
     # with "no data found".
@@ -2489,6 +2490,13 @@ def main():
             total_credits = ai_consumed
             print(f"  Consumed credits from AI usage metrics API: {total_credits:,.2f}")
 
+    if total_credits is None and ai_usage_metrics_cc_processed:
+        cc_consumed = ai_usage_metrics_cc_processed.get("consumed_credits")
+        if cc_consumed is not None:
+            total_credits = cc_consumed
+            print(f"  Consumed credits from AI usage metrics API (cost_center grouping): "
+                  f"{total_credits:,.2f}")
+
     if total_credits is None and per_user_processed and per_user_processed["total_credits"] > 0:
         total_credits = per_user_processed["total_credits"]
         print(f"  Consumed credits from per-user metrics (sum of ai_credits_used): "
@@ -2498,7 +2506,7 @@ def main():
         total_credits = usage_summary_processed["total_credits"]
         print(f"  Consumed credits from billing usage-summary API: {total_credits:,.2f}")
 
-    # Step 5: use the total derived from ai_usage_by_cc (cost-center grouping).
+    # Step 6: use the total derived from ai_usage_by_cc (cost-center grouping).
     if total_credits is None and ai_usage_cc_processed:
         cc_consumed = ai_usage_cc_processed.get("consumed_credits")
         if cc_consumed is not None and cc_consumed > 0:
@@ -2506,7 +2514,7 @@ def main():
             print(f"  Consumed credits from AI usage (cost center grouping): "
                   f"{total_credits:,.2f}")
 
-    # Step 6: sum model breakdown totals when the AI usage metrics endpoint returned
+    # Step 7: sum model breakdown totals when the AI usage metrics endpoint returned
     # model-level data but omitted an explicit top-level consumed_credits field.
     if total_credits is None and ai_metrics_processed and ai_metrics_processed.get("model_breakdown"):
         model_sum = sum(
