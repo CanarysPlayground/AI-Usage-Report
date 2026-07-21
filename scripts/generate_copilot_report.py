@@ -280,11 +280,18 @@ def fetch_copilot_seats(enterprise, token):
 
     Endpoint: GET /enterprises/{enterprise}/copilot/billing/seats
 
-    Returns a list of seat objects containing user info, organization,
-    and assignment details.  Used for accurate user counts.
+    Returns a dict with:
+      - "seats": list of seat objects containing user info, organization,
+                 and assignment details.
+      - "total_seats": int, the authoritative total unique licensed user count
+                       as reported by the API (users with access through
+                       multiple orgs/teams are counted only once).
+
+    Returns None if the API is unavailable.
     """
     headers = get_auth_headers(token)
     all_seats = []
+    total_seats = None
     page = 1
 
     while True:
@@ -294,6 +301,10 @@ def fetch_copilot_seats(enterprise, token):
 
         if response.status_code == 200:
             data = response.json()
+            # Capture total_seats from the first page — this is the authoritative
+            # count of unique licensed users (deduplicated across orgs/teams).
+            if total_seats is None:
+                total_seats = data.get("total_seats")
             seats = data.get("seats", [])
             if not seats:
                 break
@@ -309,7 +320,7 @@ def fetch_copilot_seats(enterprise, token):
             print(f"Warning: Copilot seats API returned {response.status_code}")
             return None
 
-    return all_seats
+    return {"seats": all_seats, "total_seats": total_seats}
 
 
 def download_ndjson(download_links):
@@ -2246,7 +2257,9 @@ def main():
 
     # 1b. Copilot seat assignments → accurate licensed user count
     print("Fetching Copilot seat assignments...")
-    seats_data = fetch_copilot_seats(enterprise, token)
+    _seats_result = fetch_copilot_seats(enterprise, token)
+    seats_data = _seats_result["seats"] if _seats_result else None
+    seats_api_total = _seats_result["total_seats"] if _seats_result else None
 
     # 1c. Per-user metrics (new API, June 2026+) → ai_credits_used per user
     print("Fetching per-user Copilot metrics...")
@@ -2359,9 +2372,8 @@ def main():
     if user_cost_center_map:
         print(f"  User-to-cost-center mapping: {len(user_cost_center_map)} users mapped")
 
-    # Get seat count — this is the authoritative count of Copilot licensed users.
-    # Deduplicate by user login to avoid double-counting users granted access
-    # through multiple organisations or enterprise teams.
+    # Get seat count by manual login deduplication — kept as a fallback for
+    # when total_seats is not present in the API response.
     seat_user_count = 0
     if seats_data:
         _seen_logins = set()
@@ -2428,17 +2440,23 @@ def main():
         total_credits = 0
 
     # User count priority:
-    #   1. Copilot billing API seat_breakdown.total (authoritative)
-    #   2. Copilot seats list (deduplicated logins)
-    #   3. Per-user metrics active count
-    #   4. Managed users API total count (fallback)
+    #   1. Copilot seats API total_seats (authoritative — API deduplicates users
+    #      who have access via multiple orgs/teams)
+    #   2. Copilot billing API seat_breakdown.total (fallback if seats API
+    #      did not return total_seats)
+    #   3. Copilot seats list (manual deduplicated logins — least reliable)
+    #   4. Per-user metrics active count
+    #   5. Managed users API total count (fallback)
     billing_total_seats = extract_total_licensed_seats(billing_data) if billing_data else None
-    if billing_total_seats and billing_total_seats > 0:
+    if seats_api_total is not None and seats_api_total > 0:
+        unique_users = seats_api_total
+        print(f"  Total licensed users from seats API (total_seats): {unique_users}")
+    elif billing_total_seats and billing_total_seats > 0:
         unique_users = billing_total_seats
         print(f"  Total licensed users from billing API (seat_breakdown.total): {unique_users}")
     elif seat_user_count > 0:
         unique_users = seat_user_count
-        print(f"  Total licensed users from seats API: {unique_users}")
+        print(f"  Total licensed users from seats API (deduplicated): {unique_users}")
     elif per_user_processed and per_user_processed["unique_users"] > 0:
         unique_users = per_user_processed["unique_users"]
         print("  Note: Using active user count from per-user metrics (seats API unavailable).")
