@@ -2306,10 +2306,16 @@ def main():
     )
 
     # 1j. AI usage metrics endpoint → full metrics by month (models + cost centers)
-    print("Fetching AI usage metrics...")
+    print("Fetching AI usage metrics (models)...")
     ai_usage_metrics_data = fetch_ai_usage_metrics(
         enterprise, token, year, month,
         group_by="models",
+    )
+    # Also fetch grouped by cost_center to get accurate cost-center breakdown
+    print("Fetching AI usage metrics (cost centers)...")
+    ai_usage_metrics_by_cc = fetch_ai_usage_metrics(
+        enterprise, token, year, month,
+        group_by="cost_center",
     )
 
     # 1k. Managed users → total enterprise user count (fallback)
@@ -2354,6 +2360,17 @@ def main():
         ai_metrics_processed = process_ai_usage_metrics(
             ai_usage_data if isinstance(ai_usage_data, dict) else {}
         )
+
+    # Process AI usage metrics grouped by cost center (new endpoint with cost_center grouping)
+    ai_usage_metrics_cc_processed = None
+    if ai_usage_metrics_by_cc:
+        print("Processing AI usage metrics (cost center grouping)...")
+        ai_usage_metrics_cc_processed = process_ai_usage_metrics(ai_usage_metrics_by_cc)
+        if ai_usage_metrics_cc_processed:
+            cc_consumed = ai_usage_metrics_cc_processed.get("consumed_credits")
+            cc_centers = ai_usage_metrics_cc_processed.get("cost_center_breakdown") or {}
+            print(f"  AI usage metrics (cost center grouping): consumed={cc_consumed}, "
+                  f"{len(cc_centers)} cost center(s)")
 
     # Process AI usage grouped by cost center.
     # ai_usage_by_cc is always fetched (step 1i) but was previously never consumed —
@@ -2549,16 +2566,20 @@ def main():
 
     # Cost center breakdown priority:
     #   1. Usage summary API (aggregated, most efficient, has proper cost center names)
-    #   2. AI usage metrics API cost-center breakdown
-    #   3. AI usage endpoint grouped by cost_center (ai_usage_by_cc — always fetched,
+    #   2. AI usage metrics API with cost-center grouping (most accurate, new endpoint)
+    #   3. AI usage metrics API cost-center breakdown (fallback from models grouping)
+    #   4. AI usage endpoint grouped by cost_center (ai_usage_by_cc — always fetched,
     #      was previously unused; now the processed result feeds this priority step)
-    #   4. Per-user data re-attributed via user_cost_center_map (accurate credits)
-    #   5. Per-user org breakdown (fallback when no cost center mapping available)
-    #   6. Billing usage line items (cost-center labels present but credit values unreliable)
-    #   7. Org metrics (last resort)
+    #   5. Per-user data re-attributed via user_cost_center_map (accurate credits)
+    #   6. Per-user org breakdown (fallback when no cost center mapping available)
+    #   7. Billing usage line items (cost-center labels present but credit values unreliable)
+    #   8. Org metrics (last resort)
     if usage_summary_processed and usage_summary_processed.get("cost_center_breakdown"):
         cost_center_breakdown = usage_summary_processed["cost_center_breakdown"]
         print("  Cost center breakdown from billing usage-summary API.")
+    elif ai_usage_metrics_cc_processed and ai_usage_metrics_cc_processed.get("cost_center_breakdown"):
+        cost_center_breakdown = ai_usage_metrics_cc_processed["cost_center_breakdown"]
+        print("  Cost center breakdown from AI usage metrics API (cost_center grouping).")
     elif ai_metrics_processed and ai_metrics_processed.get("cost_center_breakdown"):
         cost_center_breakdown = ai_metrics_processed["cost_center_breakdown"]
         print("  Cost center breakdown from AI usage metrics API.")
