@@ -2577,11 +2577,15 @@ def main():
         model_breakdown = metrics_processed["model_breakdown"]
 
     # Cost center breakdown priority:
-    #   1. Usage summary API (aggregated, most efficient, has proper cost center names)
-    #   2. AI usage metrics API with cost-center grouping (most accurate, new endpoint)
-    #   3. AI usage metrics API cost-center breakdown (fallback from models grouping)
-    #   4. AI usage endpoint grouped by cost_center (ai_usage_by_cc — always fetched,
-    #      was previously unused; now the processed result feeds this priority step)
+    #   1. Usage summary API (usage_summary_processed — aggregated, most efficient)
+    #   2. AI usage metrics API with cost-center grouping
+    #      (ai_usage_metrics_cost_center_processed — from fetch_ai_usage_metrics
+    #      with group_by="cost_center")
+    #   3. AI usage metrics API cost-center breakdown
+    #      (ai_metrics_processed — from fetch_ai_usage_metrics with group_by="models",
+    #      may include cost center data in response)
+    #   4. AI usage endpoint grouped by cost_center
+    #      (ai_usage_cc_processed — from fetch_ai_usage with group_by="cost_center")
     #   5. Per-user data re-attributed via user_cost_center_map (accurate credits)
     #   6. Per-user org breakdown (fallback when no cost center mapping available)
     #   7. Billing usage line items (cost-center labels present but credit values unreliable)
