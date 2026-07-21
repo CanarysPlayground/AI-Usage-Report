@@ -1221,6 +1221,9 @@ def process_billing_usage_data(billing_usage, cost_centers):
                    cc.get("customer_name") or cc.get("customerName") or "")
         if cc_id and cc_name:
             cc_id_to_name[cc_id] = cc_name
+        elif cc_id and not cc_name:
+            print(f"  Note: Cost center id={cc_id} has no name field — "
+                  f"ID-based lookup will not work for this center.")
 
     total_credits = 0.0
     cost_center_credits = defaultdict(lambda: {"credits": 0.0, "users": set()})
@@ -2340,9 +2343,10 @@ def main():
         enterprise, token, start_date, end_date
     )
 
-    # 1e. Legacy enterprise metrics (fallback if new API unavailable or produced no data)
-    # Always fetched so it can supplement the enterprise-1-day NDJSON results when
-    # those records lack the expected copilot_ide_* structure or credit fields.
+    # 1e. Legacy enterprise metrics (fallback if new reports API unavailable).
+    # Only fetched when the new enterprise-1-day reports API returned no data.
+    # A supplemental fetch may occur later (see step 2) if the new API produced
+    # records that lack model/credit fields.
     legacy_metrics_data = None
     if enterprise_metrics_data is None:
         print("Fetching enterprise Copilot metrics (legacy)...")
@@ -2838,7 +2842,7 @@ def main():
     # at this stage, we merge "Unknown" entries into known cost centers when there
     # is exactly one "Unknown" entry and exactly one cost center that hasn't
     # appeared in the breakdown yet.  When no unique mapping is possible we
-    # rename "Unknown" to the first cost center name as a best-guess fallback.
+    # warn and leave "Unknown" in place so the problem is visible in the report.
     if "Unknown" in cost_center_breakdown and cost_centers:
         known_names = {
             center.get("name") or center.get("displayName") or ""
@@ -2868,9 +2872,13 @@ def main():
                 del cost_center_breakdown["Unknown"]
                 print(f"  Merged 'Unknown' credits into '{resolved_name}'.")
         else:
-            print(f"  Note: 'Unknown' cost center could not be auto-resolved "
-                  f"(unmapped: {unmapped_names}). "
-                  f"Check API response field names in logs.")
+            # Multiple cost centers present — cannot safely auto-assign credits.
+            # Warn explicitly so the operator can check the API response logs.
+            print(f"  Warning: 'Unknown' cost center could not be auto-resolved. "
+                  f"Known names: {sorted(known_names)}; "
+                  f"already in breakdown: {sorted(existing_names)}; "
+                  f"unmapped: {sorted(unmapped_names)}. "
+                  f"Check API response field names in log output above.")
 
     report_data = {
         "total_credits": total_credits,
