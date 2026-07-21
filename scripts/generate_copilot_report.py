@@ -2365,6 +2365,33 @@ def main():
     if managed_users_data is not None:
         print(f"  Managed users API: {len(managed_users_data)} enterprise members")
 
+    # 1l. Per-cost-center AI usage metrics → ensures every known cost center is
+    #     covered even when the group_by=cost_center APIs return partial data or
+    #     are unavailable.  We call each cost center individually using the
+    #     cost_center filter parameter, trying both the monthly metrics endpoint
+    #     (ai_usage_metrics) and the date-range endpoint (ai_usage) as fallback.
+    per_cost_center_ai_data = {}
+    if cost_centers:
+        print("Fetching AI usage per cost center...")
+        for center in cost_centers:
+            center_name = center.get("name") or center.get("displayName", "Unknown")
+            if not center_name:
+                continue
+            print(f"  Cost center: '{center_name}'")
+            # Prefer the monthly metrics endpoint (more accurate for billing months)
+            cc_data = fetch_ai_usage_metrics(
+                enterprise, token, year, month, cost_center=center_name
+            )
+            if cc_data:
+                per_cost_center_ai_data[center_name] = ("metrics", cc_data)
+                continue
+            # Fallback to the date-range ai_usage endpoint
+            cc_data = fetch_ai_usage(
+                enterprise, token, start_date, end_date, cost_center=center_name
+            )
+            if cc_data:
+                per_cost_center_ai_data[center_name] = ("usage", cc_data)
+
     print()
 
     # ── Step 2: Process all data sources ──────────────────────────────────────
@@ -2491,6 +2518,36 @@ def main():
         if usage_summary_processed:
             print(f"  Usage summary: {usage_summary_processed['total_credits']:,.2f} AI credits, "
                   f"{len(usage_summary_processed['cost_center_breakdown'])} cost centers")
+
+    # Process per-cost-center AI usage data collected in step 1l.
+    # We extract the consumed credits for each cost center and store them in a
+    # plain dict so they can be used to fill gaps in cost_center_breakdown later.
+    per_cost_center_credits = {}
+    for center_name, (source, cc_data) in per_cost_center_ai_data.items():
+        credits = 0.0
+        if isinstance(cc_data, dict):
+            processed_cc = process_ai_usage_metrics(cc_data)
+            if processed_cc:
+                # Primary: top-level consumed_credits (the whole response is for
+                # this one cost center when cost_center= filter was used).
+                consumed = processed_cc.get("consumed_credits")
+                if consumed is not None and consumed > 0:
+                    credits = consumed
+                else:
+                    # Secondary: the response may embed a cost_center_breakdown
+                    # with a single entry matching this center's name.
+                    cc_bd = processed_cc.get("cost_center_breakdown") or {}
+                    if center_name in cc_bd:
+                        credits = cc_bd[center_name].get("credits", 0.0)
+                    elif cc_bd:
+                        # Sum all entries — the entire breakdown belongs to this center.
+                        credits = sum(
+                            v.get("credits", 0) for v in cc_bd.values()
+                            if isinstance(v, dict)
+                        )
+        per_cost_center_credits[center_name] = credits
+        if credits > 0:
+            print(f"  Per-cost-center '{center_name}' ({source}): {credits:,.2f} AI credits")
 
     # Build user → cost center mapping from cost centers and seats data
     user_cost_center_map = build_user_cost_center_map(cost_centers, seats_data)
@@ -2710,6 +2767,39 @@ def main():
         )
         if cc_breakdown:
             cost_center_breakdown = cc_breakdown
+
+    # ── Fill in any cost centers still missing or with 0 credits ──────────────
+    # The per-cost-center fetches from step 1l provide individual data for every
+    # known cost center.  Any center not yet in the breakdown (or present but
+    # showing 0 credits while we have actual data) is added/updated here so that
+    # all 4 (or N) cost centers always appear in the report.
+    if per_cost_center_credits and cost_centers:
+        filled = []
+        updated = []
+        for center in cost_centers:
+            center_name = center.get("name") or center.get("displayName", "Unknown")
+            if not center_name:
+                continue
+            cc_credits = per_cost_center_credits.get(center_name, 0.0)
+            existing = cost_center_breakdown.get(center_name)
+            if existing is None:
+                # Cost center completely absent from all grouped API responses
+                cost_center_breakdown[center_name] = {
+                    "credits": cc_credits,
+                    "users": set(),
+                    "user_count": 0,
+                }
+                filled.append(f"'{center_name}' ({cc_credits:,.2f} credits)")
+            elif existing.get("credits", 0) == 0 and cc_credits > 0:
+                # Present but with 0 credits; use the per-center data instead
+                existing["credits"] = cc_credits
+                updated.append(f"'{center_name}' → {cc_credits:,.2f} credits")
+        if filled:
+            print(f"  Added missing cost center(s) from per-cost-center fetch: "
+                  f"{', '.join(filled)}")
+        if updated:
+            print(f"  Updated zero-credit cost center(s) from per-cost-center fetch: "
+                  f"{', '.join(updated)}")
 
     report_data = {
         "total_credits": total_credits,
