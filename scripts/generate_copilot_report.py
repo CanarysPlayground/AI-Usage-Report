@@ -2374,7 +2374,7 @@ def main():
     if cost_centers:
         print("Fetching AI usage per cost center...")
         for center in cost_centers:
-            center_name = center.get("name") or center.get("displayName", "Unknown")
+            center_name = center.get("name") or center.get("displayName") or ""
             if not center_name:
                 continue
             print(f"  Cost center: '{center_name}'")
@@ -2777,7 +2777,7 @@ def main():
         filled = []
         updated = []
         for center in cost_centers:
-            center_name = center.get("name") or center.get("displayName", "Unknown")
+            center_name = center.get("name") or center.get("displayName") or ""
             if not center_name:
                 continue
             cc_credits = per_cost_center_credits.get(center_name, 0.0)
