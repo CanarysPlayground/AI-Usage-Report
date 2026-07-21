@@ -666,6 +666,13 @@ def process_usage_summary_data(usage_summary):
                        group.get("costCenterName") or
                        group.get("cost_center_name") or
                        group.get("name") or
+                       group.get("displayName") or
+                       group.get("customer_name") or
+                       group.get("customerName") or
+                       group.get("customer") or
+                       group.get("label") or
+                       group.get("group_name") or
+                       group.get("title") or
                        "Not Assigned")
 
             # Credits consumed by this cost center
@@ -741,7 +748,9 @@ def build_user_cost_center_map(cost_centers, seats_data):
     # Build org → cost center map and direct user → cost center map
     org_cc_map = {}
     for center in cost_centers:
-        cc_name = center.get("name") or center.get("displayName", "Unknown")
+        cc_name = center.get("name") or center.get("displayName") or ""
+        if not cc_name:
+            continue
         resources = center.get("resources", [])
         for resource in resources:
             res_type = (resource.get("type") or "").lower()
@@ -794,6 +803,14 @@ def fetch_cost_centers(enterprise, token):
             if not items:
                 break
             all_centers.extend(items)
+            if page == 1:
+                # Log cost center IDs and names to help diagnose ID resolution
+                for item in items:
+                    cc_id = (item.get("id") or item.get("cost_center_id") or
+                             item.get("customerId") or item.get("customer_id") or "?")
+                    cc_name = (item.get("name") or item.get("displayName") or
+                               item.get("customer_name") or "?")
+                    print(f"  Cost center: id={cc_id}, name='{cc_name}'")
             if len(items) < 100:
                 break
             page += 1
@@ -1014,6 +1031,10 @@ def process_metrics_data(metrics_data):
     Process metrics API data for detailed breakdowns.
     Extracts unique users from total_active_users and supports both
     total_credits_consumed (newer API) and total_ai_tokens (proxy) fields.
+
+    Sets ``has_credit_values`` to True when at least one record contained a
+    ``total_credits_consumed`` field, indicating the totals are genuine AI
+    credits rather than raw token counts.
     """
     total_credits = 0
     cost_center_credits = defaultdict(lambda: {"credits": 0, "users": set()})
@@ -1023,6 +1044,9 @@ def process_metrics_data(metrics_data):
     # monthly unique users. This will undercount if different users are active on
     # different days, but is the best approximation available from the aggregate API.
     unique_users_max = 0
+    # True when total_credits_consumed was present in at least one record — this
+    # indicates the returned values are genuine AI credits, not raw token counts.
+    has_credit_values = False
 
     for day_data in metrics_data:
         daily_users = day_data.get("total_active_users", 0) or 0
@@ -1044,6 +1068,8 @@ def process_metrics_data(metrics_data):
                         # Fall back to total_ai_tokens only if credits field is absent —
                         # both represent consumption units from the same model response and
                         # are used as proxies when the billing credit field is unavailable.
+                        if "total_credits_consumed" in lang:
+                            has_credit_values = True
                         credits = (lang.get("total_credits_consumed") or
                                    lang.get("total_ai_tokens") or 0)
                         total_credits += credits
@@ -1055,6 +1081,8 @@ def process_metrics_data(metrics_data):
                 for model_data in editor_data.get("models", []):
                     model_name = model_data.get("name", "Unknown")
                     # Same preference: credits > tokens > 0
+                    if "total_credits_consumed" in model_data:
+                        has_credit_values = True
                     credits = (model_data.get("total_credits_consumed") or
                                model_data.get("total_ai_tokens") or 0)
                     total_credits += credits
@@ -1064,6 +1092,8 @@ def process_metrics_data(metrics_data):
         if copilot_dotcom_chat:
             for model_data in copilot_dotcom_chat.get("models", []):
                 model_name = model_data.get("name", "Unknown")
+                if "total_credits_consumed" in model_data:
+                    has_credit_values = True
                 credits = (model_data.get("total_credits_consumed") or
                            model_data.get("total_ai_tokens") or 0)
                 total_credits += credits
@@ -1073,6 +1103,8 @@ def process_metrics_data(metrics_data):
         if copilot_dotcom_pull_requests:
             for model_data in copilot_dotcom_pull_requests.get("models", []):
                 model_name = model_data.get("name", "Unknown")
+                if "total_credits_consumed" in model_data:
+                    has_credit_values = True
                 credits = (model_data.get("total_credits_consumed") or
                            model_data.get("total_ai_tokens") or 0)
                 total_credits += credits
@@ -1082,7 +1114,8 @@ def process_metrics_data(metrics_data):
         "total_credits": total_credits,
         "unique_users": unique_users_max,
         "cost_center_breakdown": cost_center_credits,
-        "model_breakdown": model_credits
+        "model_breakdown": model_credits,
+        "has_credit_values": has_credit_values,
     }
 
 
@@ -1100,6 +1133,7 @@ def process_per_user_metrics(user_metrics_data, seats_data=None):
     unique_users = set()
     user_credits_map = defaultdict(float)
     org_credits = defaultdict(lambda: {"credits": 0.0, "users": set()})
+    model_credits = defaultdict(float)
 
     # Build user → org mapping from seats data
     user_org_map = {}
@@ -1115,14 +1149,36 @@ def process_per_user_metrics(user_metrics_data, seats_data=None):
 
     for record in user_metrics_data:
         username = _extract_username(record)
-        credits = float(record.get("ai_credits_used", 0) or 0)
+        # Try multiple field names – the exact name varies by API version and
+        # response format.  ai_credits_used is the canonical June-2026+ name;
+        # the others are alternative names seen in some response formats.
+        raw_credits = (
+            record.get("ai_credits_used") or
+            record.get("credits") or
+            record.get("premium_requests") or
+            record.get("credits_used") or
+            record.get("total_credits_used") or
+            record.get("total_credits") or
+            0
+        )
+        credits = float(raw_credits or 0)
         org = record.get("organization") or user_org_map.get(username, "Not Assigned")
+
+        # Extract model name if the per-user record includes it.
+        model_name = (
+            record.get("model_name") or
+            record.get("model") or
+            record.get("modelName") or
+            ""
+        )
 
         unique_users.add(username)
         user_credits_map[username] += credits
         total_credits += credits
         org_credits[org]["credits"] += credits
         org_credits[org]["users"].add(username)
+        if model_name and credits > 0:
+            model_credits[model_name] += credits
 
     return {
         "total_credits": total_credits,
@@ -1130,7 +1186,7 @@ def process_per_user_metrics(user_metrics_data, seats_data=None):
         "user_credits": dict(user_credits_map),
         "org_breakdown": dict(org_credits),
         "cost_center_breakdown": {},
-        "model_breakdown": {}
+        "model_breakdown": dict(model_credits),
     }
 
 
@@ -1159,10 +1215,15 @@ def process_billing_usage_data(billing_usage, cost_centers):
     # Build cost-center-ID → name lookup from the cost_centers list
     cc_id_to_name = {}
     for cc in (cost_centers or []):
-        cc_id = str(cc.get("id") or cc.get("cost_center_id") or "")
-        cc_name = cc.get("name") or cc.get("displayName") or "Unknown"
-        if cc_id:
+        cc_id = str(cc.get("id") or cc.get("cost_center_id") or
+                    cc.get("customerId") or cc.get("customer_id") or "")
+        cc_name = (cc.get("name") or cc.get("displayName") or
+                   cc.get("customer_name") or cc.get("customerName") or "")
+        if cc_id and cc_name:
             cc_id_to_name[cc_id] = cc_name
+        elif cc_id and not cc_name:
+            print(f"  Note: Cost center id={cc_id} has no name field — "
+                  f"ID-based lookup will not work for this center.")
 
     total_credits = 0.0
     cost_center_credits = defaultdict(lambda: {"credits": 0.0, "users": set()})
@@ -1215,12 +1276,16 @@ def process_billing_usage_data(billing_usage, cost_centers):
         quantity = float(item.get("quantity") or 0)
 
         # Resolve cost center name – try several field name variations
-        cc_id = str(item.get("costCenterId") or item.get("cost_center_id") or "")
+        cc_id = str(item.get("costCenterId") or item.get("cost_center_id") or
+                    item.get("customerId") or item.get("customer_id") or "")
         cc_name = (
             item.get("costCenter") or
             item.get("cost_center") or
             item.get("costCenterName") or
             item.get("cost_center_name") or
+            item.get("customer_name") or
+            item.get("customerName") or
+            item.get("customer") or
             cc_id_to_name.get(cc_id) or
             item.get("organizationName") or
             "Not Assigned"
@@ -1293,7 +1358,9 @@ def build_cost_center_metrics(cost_centers, token, start_date, end_date):
         return cost_center_credits
 
     for center in cost_centers:
-        center_name = center.get("name") or center.get("displayName", "Unknown")
+        center_name = center.get("name") or center.get("displayName") or ""
+        if not center_name:
+            continue
         resources = center.get("resources", [])
 
         for resource in resources:
@@ -1863,7 +1930,10 @@ def process_ai_usage_metrics(ai_usage_metrics):
             if not isinstance(cc, dict):
                 continue
             name = (cc.get("name") or cc.get("cost_center") or
-                    cc.get("cost_center_name") or "Unknown")
+                    cc.get("cost_center_name") or cc.get("displayName") or
+                    cc.get("customer_name") or cc.get("customerName") or
+                    cc.get("customer") or cc.get("label") or
+                    cc.get("group_name") or cc.get("title") or "Unknown")
             credits = _find_first_valid_number(
                 cc, ("credits_used", "total_credits", "credits")
             )
@@ -2273,7 +2343,10 @@ def main():
         enterprise, token, start_date, end_date
     )
 
-    # 1e. Legacy enterprise metrics (fallback if new API unavailable)
+    # 1e. Legacy enterprise metrics (fallback if new reports API unavailable).
+    # Only fetched when the new enterprise-1-day reports API returned no data.
+    # A supplemental fetch may occur later (see step 2) if the new API produced
+    # records that lack model/credit fields.
     legacy_metrics_data = None
     if enterprise_metrics_data is None:
         print("Fetching enterprise Copilot metrics (legacy)...")
@@ -2324,6 +2397,33 @@ def main():
     if managed_users_data is not None:
         print(f"  Managed users API: {len(managed_users_data)} enterprise members")
 
+    # 1l. Per-cost-center AI usage metrics → ensures every known cost center is
+    #     covered even when the group_by=cost_center APIs return partial data or
+    #     are unavailable.  We call each cost center individually using the
+    #     cost_center filter parameter, trying both the monthly metrics endpoint
+    #     (ai_usage_metrics) and the date-range endpoint (ai_usage) as fallback.
+    per_cost_center_ai_data = {}
+    if cost_centers:
+        print("Fetching AI usage per cost center...")
+        for center in cost_centers:
+            center_name = center.get("name") or center.get("displayName") or ""
+            if not center_name:
+                continue
+            print(f"  Cost center: '{center_name}'")
+            # Prefer the monthly metrics endpoint (more accurate for billing months)
+            cc_data = fetch_ai_usage_metrics(
+                enterprise, token, year, month, cost_center=center_name
+            )
+            if cc_data:
+                per_cost_center_ai_data[center_name] = ("metrics", cc_data)
+                continue
+            # Fallback to the date-range ai_usage endpoint
+            cc_data = fetch_ai_usage(
+                enterprise, token, start_date, end_date, cost_center=center_name
+            )
+            if cc_data:
+                per_cost_center_ai_data[center_name] = ("usage", cc_data)
+
     print()
 
     # ── Step 2: Process all data sources ──────────────────────────────────────
@@ -2342,6 +2442,25 @@ def main():
     if metrics_source:
         print("Processing enterprise-level metrics data...")
         metrics_processed = process_metrics_data(metrics_source)
+
+    # If enterprise-1-day NDJSON produced no model data or no AI-credit values,
+    # supplement with the legacy /copilot/metrics endpoint which uses a well-known
+    # format.  This covers the case where the new reports API returns records with
+    # a different structure that process_metrics_data cannot parse.
+    if (enterprise_metrics_data and not legacy_metrics_data and
+            metrics_processed is not None and
+            not metrics_processed.get("model_breakdown") and
+            not metrics_processed.get("has_credit_values")):
+        print("Fetching enterprise Copilot metrics (legacy supplement)...")
+        legacy_metrics_data = fetch_copilot_org_report(
+            enterprise, token, start_date, end_date
+        )
+        if legacy_metrics_data:
+            legacy_processed = process_metrics_data(legacy_metrics_data)
+            if legacy_processed and (legacy_processed.get("model_breakdown") or
+                                     legacy_processed.get("has_credit_values")):
+                metrics_processed = legacy_processed
+                print("  Switched to legacy metrics: better model/credit data found.")
 
     # Process AI usage metrics (new endpoint – allocated/consumed/remaining + breakdowns)
     ai_metrics_processed = None
@@ -2431,6 +2550,36 @@ def main():
         if usage_summary_processed:
             print(f"  Usage summary: {usage_summary_processed['total_credits']:,.2f} AI credits, "
                   f"{len(usage_summary_processed['cost_center_breakdown'])} cost centers")
+
+    # Process per-cost-center AI usage data collected in step 1l.
+    # We extract the consumed credits for each cost center and store them in a
+    # plain dict so they can be used to fill gaps in cost_center_breakdown later.
+    per_cost_center_credits = {}
+    for center_name, (source, cc_data) in per_cost_center_ai_data.items():
+        credits = 0.0
+        if isinstance(cc_data, dict):
+            processed_cc = process_ai_usage_metrics(cc_data)
+            if processed_cc:
+                # Primary: top-level consumed_credits (the whole response is for
+                # this one cost center when cost_center= filter was used).
+                consumed = processed_cc.get("consumed_credits")
+                if consumed is not None and consumed > 0:
+                    credits = consumed
+                else:
+                    # Secondary: the response may embed a cost_center_breakdown
+                    # with a single entry matching this center's name.
+                    cc_bd = processed_cc.get("cost_center_breakdown") or {}
+                    if center_name in cc_bd:
+                        credits = cc_bd[center_name].get("credits", 0.0)
+                    elif cc_bd:
+                        # Sum all entries — the entire breakdown belongs to this center.
+                        credits = sum(
+                            v.get("credits", 0) for v in cc_bd.values()
+                            if isinstance(v, dict)
+                        )
+        per_cost_center_credits[center_name] = credits
+        if credits > 0:
+            print(f"  Per-cost-center '{center_name}' ({source}): {credits:,.2f} AI credits")
 
     # Build user → cost center mapping from cost centers and seats data
     user_cost_center_map = build_user_cost_center_map(cost_centers, seats_data)
@@ -2530,6 +2679,21 @@ def main():
             print(f"  Consumed credits from AI usage metrics model breakdown sum: "
                   f"{total_credits:,.2f}")
 
+    # Step 8: Enterprise / legacy Copilot metrics API total.
+    # Only used when the API returned genuine AI-credit values
+    # (total_credits_consumed field present), not raw token counts.
+    if total_credits is None and metrics_processed:
+        metrics_total = metrics_processed.get("total_credits", 0) or 0
+        if metrics_total > 0:
+            if metrics_processed.get("has_credit_values"):
+                total_credits = metrics_total
+                print(f"  Consumed credits from enterprise metrics API "
+                      f"(aggregated from total_credits_consumed): {total_credits:,.2f}")
+            else:
+                print(f"  Note: Enterprise metrics returned token counts "
+                      f"({metrics_total:,.0f}) rather than AI credits — "
+                      f"skipping to avoid inflated figures.")
+
     if total_credits is None:
         print("  Warning: Could not determine consumed AI credits.")
         print("  Ensure the token has 'manage_billing:copilot' scope and that there "
@@ -2563,12 +2727,23 @@ def main():
 
     # Model breakdown priority:
     #   1. AI usage metrics API (AI-credit-based with included/additional breakdown)
-    #   2. Billing usage line items (AI-credit-based with included/additional breakdown)
-    #   3. Enterprise metrics API (last resort — legacy token-count values, not AI credits;
+    #   2. Per-user metrics model data (AI-credit-based, extracted from per-user records)
+    #   3. Billing usage line items (AI-credit-based with included/additional breakdown)
+    #   4. Enterprise metrics API (last resort — may be token-count values, not AI credits;
     #      values are plain floats so the report cannot show an included/additional split)
     if ai_metrics_processed and ai_metrics_processed.get("model_breakdown"):
         model_breakdown = ai_metrics_processed["model_breakdown"]
         print("  Model breakdown from AI usage metrics API.")
+    elif per_user_processed and per_user_processed.get("model_breakdown"):
+        pu_models = per_user_processed["model_breakdown"]
+        if _has_named_models(pu_models):
+            # Wrap plain totals in the dict format used by the detailed breakdown path
+            # so the report displays them with proper included/additional columns.
+            model_breakdown = {
+                name: {"total": total, "included": total, "additional": 0.0}
+                for name, total in pu_models.items()
+            }
+            print("  Model breakdown from per-user metrics data.")
     elif billing_usage_processed and billing_usage_processed.get("model_breakdown"):
         billing_models = billing_usage_processed["model_breakdown"]
         if _has_named_models(billing_models):
@@ -2624,6 +2799,86 @@ def main():
         )
         if cc_breakdown:
             cost_center_breakdown = cc_breakdown
+
+    # ── Fill in any cost centers still missing or with 0 credits ──────────────
+    # The per-cost-center fetches from step 1l provide individual data for every
+    # known cost center.  Any center not yet in the breakdown (or present but
+    # showing 0 credits while we have actual data) is added/updated here so that
+    # all 4 (or N) cost centers always appear in the report.
+    if per_cost_center_credits and cost_centers:
+        filled = []
+        updated = []
+        for center in cost_centers:
+            center_name = center.get("name") or center.get("displayName") or ""
+            if not center_name:
+                continue
+            cc_credits = per_cost_center_credits.get(center_name, 0.0)
+            existing = cost_center_breakdown.get(center_name)
+            if existing is None:
+                # Cost center completely absent from all grouped API responses
+                cost_center_breakdown[center_name] = {
+                    "credits": cc_credits,
+                    "users": set(),
+                    "user_count": 0,
+                }
+                filled.append(f"'{center_name}' ({cc_credits:,.2f} credits)")
+            elif existing.get("credits", 0) == 0 and cc_credits > 0:
+                # Present but with 0 credits; use the per-center data instead
+                existing["credits"] = cc_credits
+                updated.append(f"'{center_name}' → {cc_credits:,.2f} credits")
+        if filled:
+            print(f"  Added missing cost center(s) from per-cost-center fetch: "
+                  f"{', '.join(filled)}")
+        if updated:
+            print(f"  Updated zero-credit cost center(s) from per-cost-center fetch: "
+                  f"{', '.join(updated)}")
+
+    # ── Resolve any remaining "Unknown" cost center names ─────────────────────
+    # If the breakdown contains entries named "Unknown" (produced when the API
+    # returned a cost center object without a recognised name field), try to
+    # replace them with proper names from the cost centers list.
+    # Strategy: each cost center in the cost_centers list has an 'id'.  Billing
+    # API items expose this as costCenterId / customerId.  Since we can't re-match
+    # at this stage, we merge "Unknown" entries into known cost centers when there
+    # is exactly one "Unknown" entry and exactly one cost center that hasn't
+    # appeared in the breakdown yet.  When no unique mapping is possible we
+    # warn and leave "Unknown" in place so the problem is visible in the report.
+    if "Unknown" in cost_center_breakdown and cost_centers:
+        known_names = {
+            center.get("name") or center.get("displayName") or ""
+            for center in cost_centers
+        } - {""}
+        # Names already present in the breakdown (excluding "Unknown")
+        existing_names = set(cost_center_breakdown.keys()) - {"Unknown"}
+        unmapped_names = known_names - existing_names
+
+        if len(unmapped_names) == 1:
+            # Exactly one cost center not yet in breakdown — rename "Unknown" to it
+            resolved_name = next(iter(unmapped_names))
+            cost_center_breakdown[resolved_name] = cost_center_breakdown.pop("Unknown")
+            print(f"  Resolved 'Unknown' cost center → '{resolved_name}' "
+                  f"(only unmapped cost center)")
+        elif not unmapped_names and len(known_names) == 1:
+            # All known cost centers are already present but there's still an
+            # "Unknown" — merge its credits into the single known cost center.
+            resolved_name = next(iter(known_names))
+            if resolved_name in cost_center_breakdown:
+                cost_center_breakdown[resolved_name]["credits"] += (
+                    cost_center_breakdown["Unknown"].get("credits", 0)
+                )
+                cost_center_breakdown[resolved_name]["users"].update(
+                    cost_center_breakdown["Unknown"].get("users", set())
+                )
+                del cost_center_breakdown["Unknown"]
+                print(f"  Merged 'Unknown' credits into '{resolved_name}'.")
+        else:
+            # Multiple cost centers present — cannot safely auto-assign credits.
+            # Warn explicitly so the operator can check the API response logs.
+            print(f"  Warning: 'Unknown' cost center could not be auto-resolved. "
+                  f"Known names: {sorted(known_names)}; "
+                  f"already in breakdown: {sorted(existing_names)}; "
+                  f"unmapped: {sorted(unmapped_names)}. "
+                  f"Check API response field names in log output above.")
 
     report_data = {
         "total_credits": total_credits,
