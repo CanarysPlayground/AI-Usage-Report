@@ -1,15 +1,40 @@
 # Place this file at: .github/workflows/copilot-ai-usage-report.yml
 # in a repo the enterprise billing-manager/owner token can push to.
 #
-# Runs at 06:00 UTC on the 1st of every month, generates the detailed usage
-# report for the month that just ended, and commits + uploads the CSV.
+# Runs at 03:00 UTC (08:30 AM IST) on the 1st of every month, generates the
+# detailed usage report for the month that just ended, and commits + uploads
+# the CSV, then sends it via email.
+#
+# Required secrets:
+#   BILLING_PAT      — PAT with manage_billing:enterprise (or fine-grained
+#                      "Enterprise administration" write permission)
+#   SMTP_SERVER      — SMTP hostname (e.g. smtp.gmail.com)
+#   SMTP_PORT        — SMTP port (e.g. 587 for STARTTLS)
+#   SMTP_USERNAME    — SMTP login / sender address
+#   SMTP_PASSWORD    — SMTP password or app-password
+#   REPORT_EMAIL_TO  — Recipient address(es), comma-separated if multiple
+#
+# Required variables:
+#   ENTERPRISE_SLUG  — GitHub enterprise slug
 
 name: Copilot AI Usage Monthly Report
 
 on:
   schedule:
-    - cron: "0 6 1 * *"   # 06:00 UTC, 1st of every month
-  workflow_dispatch: {}    # allows manual runs / backfills
+    - cron: "0 3 1 * *"   # 03:00 UTC = 08:30 AM IST, 1st of every month
+  workflow_dispatch:
+    inputs:
+      report_month:
+        description: >
+          Select which month's report to generate.
+          "previous-month" = the month that just ended (1 month ago).
+          "2-months-ago"   = the month before that (2 months ago).
+        required: true
+        default: 'previous-month'
+        type: choice
+        options:
+          - 'previous-month'
+          - '2-months-ago'
 
 jobs:
   generate-report:
@@ -26,13 +51,31 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Generate report for previous month
+      - name: Compute report month
+        id: month
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.report_month }}" = "2-months-ago" ]; then
+            REPORT_DATE=$(date -d "$(date +%Y-%m-01) -2 month" +%Y-%m-01)
+          else
+            REPORT_DATE=$(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m-01)
+          fi
+          YEAR=$(date -d "$REPORT_DATE" +%Y)
+          MONTH=$(date -d "$REPORT_DATE" +%-m)
+          LABEL=$(date -d "$REPORT_DATE" +%Y-%m)
+          echo "year=$YEAR"   >> $GITHUB_OUTPUT
+          echo "month=$MONTH" >> $GITHUB_OUTPUT
+          echo "label=$LABEL" >> $GITHUB_OUTPUT
+
+      - name: Generate report for selected month
         env:
           GITHUB_TOKEN: ${{ secrets.BILLING_PAT }}   # PAT with manage_billing:enterprise (or fine-grained "Enterprise administration" write)
           GITHUB_ENTERPRISE: ${{ vars.ENTERPRISE_SLUG }}
         run: |
           mkdir -p reports
-          python copilot_ai_usage_report.py --output reports/copilot_ai_usage_$(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m).csv
+          python scripts/copilot_ai_usage_report.py \
+            --year ${{ steps.month.outputs.year }} \
+            --month ${{ steps.month.outputs.month }} \
+            --output reports/copilot_ai_usage_${{ steps.month.outputs.label }}.csv
 
       - name: Upload as workflow artifact
         uses: actions/upload-artifact@v4
@@ -45,5 +88,55 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add reports/*.csv
-          git commit -m "Add Copilot AI usage report for $(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m)" || echo "Nothing to commit"
+          git commit -m "Add Copilot AI usage report for ${{ steps.month.outputs.label }}" || echo "Nothing to commit"
           git push
+
+      - name: Send report via email
+        env:
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.REPORT_EMAIL_TO }}
+          REPORT_LABEL: ${{ steps.month.outputs.label }}
+        run: |
+          python - <<'EOF'
+          import os, smtplib, glob
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from email.mime.base import MIMEBase
+          from email import encoders
+
+          smtp_server = os.environ["SMTP_SERVER"]
+          smtp_port   = int(os.environ.get("SMTP_PORT", "587"))
+          smtp_user   = os.environ["SMTP_USERNAME"]
+          smtp_pass   = os.environ["SMTP_PASSWORD"]
+          email_to    = os.environ["EMAIL_TO"]
+          label       = os.environ["REPORT_LABEL"]
+
+          msg = MIMEMultipart()
+          msg["From"]    = smtp_user
+          msg["To"]      = email_to
+          msg["Subject"] = f"Copilot AI Usage Report \u2014 {label}"
+
+          body = f"Please find attached the Copilot AI Usage Report for {label}."
+          msg.attach(MIMEText(body, "plain"))
+
+          for csv_file in glob.glob(f"reports/copilot_ai_usage_{label}.csv"):
+              with open(csv_file, "rb") as f:
+                  part = MIMEBase("application", "octet-stream")
+                  part.set_payload(f.read())
+              encoders.encode_base64(part)
+              part.add_header(
+                  "Content-Disposition",
+                  f"attachment; filename={os.path.basename(csv_file)}"
+              )
+              msg.attach(part)
+
+          with smtplib.SMTP(smtp_server, smtp_port) as server:
+              server.starttls()
+              server.login(smtp_user, smtp_pass)
+              server.sendmail(smtp_user, email_to.split(","), msg.as_string())
+
+          print("Email sent successfully.")
+          EOF
