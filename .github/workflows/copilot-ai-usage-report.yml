@@ -101,7 +101,7 @@ jobs:
           REPORT_LABEL: ${{ steps.month.outputs.label }}
         run: |
           python - <<'EOF'
-          import os, smtplib, glob
+          import os, smtplib
           from email.mime.multipart import MIMEMultipart
           from email.mime.text import MIMEText
           from email.mime.base import MIMEBase
@@ -122,7 +122,8 @@ jobs:
           body = f"Please find attached the Copilot AI Usage Report for {label}."
           msg.attach(MIMEText(body, "plain"))
 
-          for csv_file in glob.glob(f"reports/copilot_ai_usage_{label}.csv"):
+          csv_file = f"reports/copilot_ai_usage_{label}.csv"
+          if os.path.exists(csv_file):
               with open(csv_file, "rb") as f:
                   part = MIMEBase("application", "octet-stream")
                   part.set_payload(f.read())
@@ -133,10 +134,14 @@ jobs:
               )
               msg.attach(part)
 
-          with smtplib.SMTP(smtp_server, smtp_port) as server:
-              server.starttls()
-              server.login(smtp_user, smtp_pass)
-              server.sendmail(smtp_user, email_to.split(","), msg.as_string())
-
-          print("Email sent successfully.")
+          recipients = [e.strip() for e in email_to.split(",") if e.strip()]
+          try:
+              with smtplib.SMTP(smtp_server, smtp_port) as server:
+                  server.starttls()
+                  server.login(smtp_user, smtp_pass)
+                  server.sendmail(smtp_user, recipients, msg.as_string())
+              print("Email sent successfully.")
+          except Exception as exc:
+              print(f"ERROR: Failed to send email — {exc}", flush=True)
+              raise SystemExit(1) from exc
           EOF
