@@ -1,0 +1,75 @@
+# Runs on the 1st of every month and appends the new month to the
+# report_month dropdown in copilot-ai-usage-report.yml so that the
+# options list always covers 2026-06 through the current month.
+
+name: Update Report Month Dropdown
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"   # midnight UTC on the 1st of every month
+  workflow_dispatch:        # allow a manual run at any time
+
+jobs:
+  update-months:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update month options in workflow
+        run: |
+          python - <<'PYEOF'
+          import re
+          from datetime import date
+
+          # Months always start from 2026-06
+          start = date(2026, 6, 1)
+          today = date.today()
+          current = date(today.year, today.month, 1)
+
+          months = []
+          d = start
+          while d <= current:
+              months.append(d.strftime('%Y-%m'))
+              # advance one month
+              if d.month == 12:
+                  d = date(d.year + 1, 1, 1)
+              else:
+                  d = date(d.year, d.month + 1, 1)
+
+          wf_path = '.github/workflows/copilot-ai-usage-report.yml'
+          with open(wf_path, 'r') as f:
+              content = f.read()
+
+          # Replace the options block (all lines "          - 'YYYY-MM'")
+          options_str = '\n'.join("          - '" + m + "'" for m in months)
+          content = re.sub(
+              r"(        options:\n)((?:          - '[\d-]+'\n)*)",
+              "        options:\n" + options_str + "\n",
+              content
+          )
+
+          # Update the default to the current month
+          content = re.sub(
+              r"        default: '\d{4}-\d{2}'",
+              "        default: '" + months[-1] + "'",
+              content
+          )
+
+          with open(wf_path, 'w') as f:
+              f.write(content)
+
+          print('Updated month options: ' + str(months))
+          PYEOF
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git diff --quiet && echo "No changes to commit" || (
+            git add .github/workflows/copilot-ai-usage-report.yml
+            git commit -m "chore: add $(date +%Y-%m) to report month dropdown"
+            git push
+          )

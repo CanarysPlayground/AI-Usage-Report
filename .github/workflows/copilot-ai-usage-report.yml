@@ -6,16 +6,14 @@
 # the CSV, then sends it via email.
 #
 # Required secrets:
-#   BILLING_PAT      — PAT with manage_billing:enterprise (or fine-grained
+#   COPILOT_TOKEN    — PAT with manage_billing:enterprise (or fine-grained
 #                      "Enterprise administration" write permission)
+#   ENTERPRISE_SLUG  — GitHub enterprise slug
 #   SMTP_SERVER      — SMTP hostname (e.g. smtp.gmail.com)
 #   SMTP_PORT        — SMTP port (e.g. 587 for STARTTLS)
 #   SMTP_USERNAME    — SMTP login / sender address
 #   SMTP_PASSWORD    — SMTP password or app-password
 #   REPORT_EMAIL_TO  — Recipient address(es), comma-separated if multiple
-#
-# Required variables:
-#   ENTERPRISE_SLUG  — GitHub enterprise slug
 
 name: Copilot AI Usage Monthly Report
 
@@ -26,15 +24,14 @@ on:
     inputs:
       report_month:
         description: >
-          Select which month's report to generate.
-          "previous-month" = the month that just ended (1 month ago).
-          "2-months-ago"   = the month before that (2 months ago).
+          Select which month's report to generate (YYYY-MM).
+          Choose the month whose data you want to pull.
         required: true
-        default: 'previous-month'
+        default: '2026-07'
         type: choice
         options:
-          - 'previous-month'
-          - '2-months-ago'
+          - '2026-06'
+          - '2026-07'
 
 jobs:
   generate-report:
@@ -54,8 +51,8 @@ jobs:
       - name: Compute report month
         id: month
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.report_month }}" = "2-months-ago" ]; then
-            REPORT_DATE=$(date -d "$(date +%Y-%m-01) -2 month" +%Y-%m-01)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            REPORT_DATE="${{ inputs.report_month }}-01"
           else
             REPORT_DATE=$(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m-01)
           fi
@@ -68,8 +65,8 @@ jobs:
 
       - name: Generate report for selected month
         env:
-          GITHUB_TOKEN: ${{ secrets.BILLING_PAT }}   # PAT with manage_billing:enterprise (or fine-grained "Enterprise administration" write)
-          GITHUB_ENTERPRISE: ${{ vars.ENTERPRISE_SLUG }}
+          GITHUB_TOKEN: ${{ secrets.COPILOT_TOKEN }}   # PAT with manage_billing:enterprise (or fine-grained "Enterprise administration" write)
+          GITHUB_ENTERPRISE: ${{ secrets.ENTERPRISE_SLUG }}
         run: |
           mkdir -p reports
           python scripts/copilot_ai_usage_report.py \
