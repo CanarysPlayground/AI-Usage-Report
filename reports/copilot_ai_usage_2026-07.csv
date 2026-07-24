@@ -2,41 +2,34 @@
 
 OVERALL METRICS
 Total Allocated Credits,"61,000.00"
-Total AI Credits Used,"58,770.32"
+Total AI Credits Used,"45,755.25"
+Total Additional AI Credits (beyond included pool),0.00
 Total Copilot Licensed Users,19
 Total Unique Users,16
 
 COST CENTER WISE AI CREDIT USAGE
-Cost Center,Total AI Credits,Unique Users,% of Total Credits
-(Not Assigned),"18,166.29",12,30.91%
-TestCC-July,"14,801.67",8,25.19%
-PowerUsers-$20,"12,942.72",2,22.02%
-Power Users,"12,214.34",3,20.78%
-Copilot-Budget-AK-NK,642.16,1,1.09%
-Org-canarysresource Cost center,3.14,0,0.01%
-BU-1,0.00,0,0.00%
-Test,0.00,0,0.00%
-Test CC,0.00,0,0.00%
-copilot-premium-request,0.00,0,0.00%
-product-test,0.00,0,0.00%
-ttttt,0.00,0,0.00%
-TOTAL,"58,770.32",16,100.00%
+Cost Center,Total AI Credits,Additional AI Credits,Unique Users,% of Total Credits
+(Not Assigned),"18,166.29",0.00,12,39.70%
+TestCC-July,"15,165.79",0.00,8,33.15%
+Power Users,"12,420.02",0.00,3,27.14%
+Org-canarysresource Cost center,3.14,0.00,0,0.01%
+TOTAL,"45,755.25",0.00,16,100.00%
 
 MODEL WISE AI CREDIT USAGE
-Model Name,Total AI Credits,% of Total Credits
-Claude Sonnet 4.6,"36,142.89",61.50%
-Coding Agent model,"9,591.86",16.32%
-Claude Haiku 4.5,"4,820.96",8.20%
-Claude Opus 4.6,"3,378.83",5.75%
-Auto: GPT-5.3-Codex,"2,744.44",4.67%
-GPT-5.4 mini,532.82,0.91%
-Claude Sonnet 4.5,415.35,0.71%
-Claude Opus 4.5,367.11,0.62%
-Auto: Claude Sonnet 4.6,216.43,0.37%
-Auto: Claude Haiku 4.5,156.22,0.27%
-GPT-5 mini,144.78,0.25%
-Code Review model,94.14,0.16%
-Auto: GPT-5.4 mini,87.36,0.15%
-GPT-5.3-Codex,50.21,0.09%
-MAI-Code-1-Flash,26.93,0.05%
-TOTAL,"58,770.32",100.00%
+Model Name,Total AI Credits,Additional AI Credits,% of Total Credits
+Claude Sonnet 4.6,"26,150.14",0.00,57.15%
+Coding Agent model,"7,027.95",0.00,15.36%
+Claude Haiku 4.5,"4,720.19",0.00,10.32%
+Claude Opus 4.6,"3,378.83",0.00,7.38%
+Auto: GPT-5.3-Codex,"2,549.99",0.00,5.57%
+GPT-5.4 mini,511.97,0.00,1.12%
+Claude Opus 4.5,367.11,0.00,0.80%
+Claude Sonnet 4.5,337.26,0.00,0.74%
+Auto: Claude Sonnet 4.6,199.47,0.00,0.44%
+Auto: Claude Haiku 4.5,155.55,0.00,0.34%
+GPT-5 mini,125.42,0.00,0.27%
+Auto: GPT-5.4 mini,85.14,0.00,0.19%
+Code Review model,82.29,0.00,0.18%
+GPT-5.3-Codex,36.99,0.00,0.08%
+MAI-Code-1-Flash,26.93,0.00,0.06%
+TOTAL,"45,755.25",0.00,100.00%
