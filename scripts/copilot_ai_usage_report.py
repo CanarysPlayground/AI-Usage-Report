@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GitHub Copilot AI Usage — Monthly Report Generator (v4)
+GitHub Copilot AI Usage — Monthly Report Generator (v5)
 ----------------------------------------------------------
 Produces a CSV with three sections:
 
@@ -9,10 +9,11 @@ Produces a CSV with three sections:
     Licensed Users, Total Unique Users
 
   COST CENTER WISE AI CREDIT USAGE
-    Cost Center, Total AI Credits, Unique Users, % of Total Credits
+    Cost Center, Total AI Credits, Additional AI Credits, Unique Users,
+    % of Total Credits
 
   MODEL WISE AI CREDIT USAGE
-    Model Name, Total AI Credits, % of Total Credits
+    Model Name, Total AI Credits, Additional AI Credits, % of Total Credits
 
 WHERE DATA ACTUALLY COMES FROM
 -------------------------------
@@ -23,10 +24,11 @@ come from the same endpoint GitHub's own billing UI uses:
       ?year=...&month=...&cost_center_id=<id>   # per cost center (looped over ALL cost centers)
       ?year=...&month=...&cost_center_id=none   # usage not assigned to any cost center
 
-Every cost center returned by the cost-centers list is queried and
-included in the report, even ones with zero usage this period -- an
-earlier version silently dropped any cost center whose usage came back
-as 0, which is what caused "only 3 of 5 cost centers" showing up.
+Only cost centers with actual usage (grossQuantity > 0) this period are
+included in the report. Cost centers that exist but show zero usage --
+whether because they are stale, inactive, or their activity predates the
+reporting window -- are silently dropped, so every row in the report
+reflects real consumption.
 
 The enterprise-wide total and the MODEL WISE breakdown are built by
 SUMMING every one of those per-bucket calls, rather than by making a
@@ -376,7 +378,7 @@ def aggregate_detailed(csv_text):
         "total_credits": total_credits,
         "total_unique_users": len(all_users),
         "total_transactions": len(rows),
-        "cc_credits": cc_credits,
+        "cc_credits": {k: v for k, v in cc_credits.items() if v > 0.0},
         "cc_users": {k: len(v) for k, v in cc_users.items()},
         "headers": reader.fieldnames,
     }
@@ -448,14 +450,14 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
 
       cc_additional / model_additional: {name: additional_credits} -- just
         the portion billed BEYOND the included pool, i.e. each item's
-        `netQuantity` (matches the billing UI's "Additional credits"
+        `netQuantity` (matches the billing UI's "Additional AI Credits"
         column; 0 for a cost center/model that stayed within its included
         allotment).
 
     Cost centers (and models) with zero total credits this period are
     dropped from the result entirely, rather than shown as a 0.00 row --
-    a cost center with no activity this month typically means it's
-    unused/stale, and the report should only reflect real usage.
+    a cost center with no activity this month (deleted, stale, or inactive)
+    is excluded so the report only reflects real consumption.
 
     Built by summing every per-bucket call rather than trusting a single
     unfiltered call to ai_credit/usage as "the enterprise total" -- GitHub's
@@ -478,9 +480,10 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
             net = float(item.get("netQuantity") or 0)  # portion beyond the included pool
             total += gross
             additional += net
-            model = (item.get("model") or "").strip() or "(No model)"
-            model_credits[model] = model_credits.get(model, 0.0) + gross
-            model_additional[model] = model_additional.get(model, 0.0) + net
+            if gross > 0:
+                model = (item.get("model") or "").strip() or "(No model)"
+                model_credits[model] = model_credits.get(model, 0.0) + gross
+                model_additional[model] = model_additional.get(model, 0.0) + net
         if total > 0:
             cc_credits[cc_name] = cc_credits.get(cc_name, 0.0) + total
             cc_additional[cc_name] = cc_additional.get(cc_name, 0.0) + additional
@@ -509,12 +512,13 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
 
 
 # ---------------------------------------------------------------------------
-# Step 5: write the three-section CSV
+# Step 5: write the four-section CSV
 # ---------------------------------------------------------------------------
 
 def write_report(output_path, detailed_agg, model_credits, model_additional, cc_api_credits, cc_additional,
                  enterprise_total, enterprise_additional, total_licensed_users, total_allocated_credits,
                  year, month, unrecognized_plans=None):
+
     with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
 
@@ -524,7 +528,7 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
         writer.writerow(["OVERALL METRICS"])
         writer.writerow(["Total Allocated Credits", f"{total_allocated_credits:,.2f}"])
         writer.writerow(["Total AI Credits Used", f"{enterprise_total:,.2f}"])
-        writer.writerow(["Total Additional Credits (beyond included pool)", f"{enterprise_additional:,.2f}"])
+        writer.writerow(["Total Additional AI Credits (beyond included pool)", f"{enterprise_additional:,.2f}"])
         writer.writerow(["Total Copilot Licensed Users", total_licensed_users])
         writer.writerow(["Total Unique Users", detailed_agg["total_unique_users"]])
         if unrecognized_plans:
@@ -534,7 +538,7 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
         writer.writerow([])
 
         writer.writerow(["COST CENTER WISE AI CREDIT USAGE"])
-        writer.writerow(["Cost Center", "Total AI Credits", "Additional Credits", "Unique Users", "% of Total Credits"])
+        writer.writerow(["Cost Center", "Total AI Credits", "Additional AI Credits", "Unique Users", "% of Total Credits"])
         for cc_name in sorted(cc_api_credits, key=lambda k: -cc_api_credits[k]):
             credits_ = cc_api_credits[cc_name]
             additional_ = cc_additional.get(cc_name, 0.0)
@@ -546,7 +550,7 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
         writer.writerow([])
 
         writer.writerow(["MODEL WISE AI CREDIT USAGE"])
-        writer.writerow(["Model Name", "Total AI Credits", "Additional Credits", "% of Total Credits"])
+        writer.writerow(["Model Name", "Total AI Credits", "Additional AI Credits", "% of Total Credits"])
         for model in sorted(model_credits, key=lambda k: -model_credits[k]):
             credits_ = model_credits[model]
             additional_ = model_additional.get(model, 0.0)
@@ -594,8 +598,9 @@ def main():
 
     # Per-cost-center AND model credits (total + additional/overage) from
     # ai_credit/usage, built together from the same set of calls so every
-    # section reconciles. Only active cost centers with real usage this
-    # period end up in the report.
+    # section reconciles. Only active cost centers with real usage (> 0) this
+    # period end up in the report; deleted or inactive cost centers with no
+    # usage are silently excluded.
     print("Fetching cost centers...")
     try:
         cost_centers = fetch_cost_centers(session, args.enterprise)  # active_only=True by default
@@ -611,6 +616,7 @@ def main():
               f"Falling back to detailed report totals (these come from a different "
               f"report type and may not exactly match the billing UI; additional-credits "
               f"figures won't be available in this fallback).", file=sys.stderr)
+        # detailed_agg["cc_credits"] already has 0-credit entries filtered out
         cc_api_credits = detailed_agg["cc_credits"]
         cc_additional = {}
         model_credits = {"(Model Breakdown Unavailable)": detailed_agg["total_credits"]}
@@ -635,7 +641,7 @@ def main():
     print(f"\nDone. Report written to {output_path}")
     print(f"  Total Allocated Credits: {total_allocated_credits:,.2f}")
     print(f"  Total AI Credits Used: {enterprise_total:,.2f}")
-    print(f"  Total Additional Credits: {enterprise_additional:,.2f}")
+    print(f"  Total Additional AI Credits: {enterprise_additional:,.2f}")
     print(f"  Total Copilot Licensed Users: {total_licensed_users}")
     print(f"  Total Unique Users: {detailed_agg['total_unique_users']}")
 
