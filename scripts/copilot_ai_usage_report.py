@@ -75,9 +75,15 @@ person can hold a seat record from more than one organization within an
 enterprise, but GitHub only bills — and should only be counted — once
 per unique user.
 
-Requires a token (classic PAT with manage_billing:enterprise scope, or a
-fine-grained PAT/GitHub App token with "Enterprise administration" write
-permission) held by an enterprise admin or billing manager.
+Requires a CLASSIC PAT with the manage_billing:enterprise scope, held by an
+enterprise admin or billing manager. A fine-grained PAT or GitHub App token
+will NOT work for this script: the cost-centers endpoint
+(/enterprises/{enterprise}/settings/billing/cost-centers) and the usage
+report export endpoints explicitly reject GitHub App user/installation
+tokens and fine-grained PATs (per GitHub's REST API docs), so the
+cost-center listing and the detailed export -- and therefore the COST
+CENTER WISE and MODEL WISE sections -- would fail even though the
+AI-credit-usage and seats calls might succeed with such a token.
 
 Usage:
     export GITHUB_TOKEN=ghp_xxx
@@ -105,6 +111,26 @@ DEFAULT_BASE_URL = "https://api.github.com"
 
 def base_url():
     return os.environ.get("GITHUB_API_BASE_URL", DEFAULT_BASE_URL)
+
+
+def warn_if_unsupported_token(token):
+    """
+    The cost-centers and usage-report-export endpoints reject fine-grained
+    PATs and GitHub App tokens outright (classic PAT only). Fine-grained
+    PATs are identifiable by their 'github_pat_' prefix; GitHub App
+    installation/user tokens start with 'ghs_'/'ghu_'. Catching this here
+    means the COST CENTER WISE / MODEL WISE sections fail loudly up front
+    instead of quietly falling back to the degraded detailed-report-only
+    path later, which is easy to miss.
+    """
+    if token.startswith("github_pat_") or token.startswith("ghs_") or token.startswith("ghu_"):
+        print(
+            "WARNING: this token looks like a fine-grained PAT or GitHub App token. "
+            "The cost-centers and usage-report-export endpoints only accept classic "
+            "PATs (manage_billing:enterprise scope). Expect 403s on the cost-center "
+            "and model breakdown -- switch to a classic PAT (ghp_...) if you hit them.",
+            file=sys.stderr,
+        )
 
 
 def make_session(token):
@@ -354,7 +380,14 @@ def aggregate_detailed(csv_text):
             f"Actual headers were: {reader.fieldnames}."
         )
 
-    rows = [r for r in reader if is_relevant_row(r, cols)]
+    all_rows = list(reader)
+    rows = [r for r in all_rows if is_relevant_row(r, cols)]
+    excluded = len(all_rows) - len(rows)
+    if excluded:
+        print(f"  Detailed export: {len(all_rows)} total row(s) across all metered products, "
+              f"{excluded} excluded as non-Copilot-AI-credit rows, {len(rows)} kept. "
+              f"(This filter is heuristic -- see is_relevant_row -- so double-check counts "
+              f"look right if this report looks off.)", file=sys.stderr)
 
     total_credits = 0.0
     all_users = set()
@@ -406,18 +439,25 @@ def fetch_ai_credit_usage_by_model(session, enterprise, year, month, cost_center
 def fetch_cost_centers(session, enterprise, active_only=True):
     """
     Returns cost centers. GitHub's documented response for this endpoint is
-    a flat, unpaginated `costCenters` array; each object carries its own
-    `state` field ("active" / "archived" etc.) rather than the endpoint
-    supporting a `state=` query filter, so filtering is done client-side
-    here instead of trusting an unverified query param. Deleted/archived
-    cost centers are excluded by default (active_only=True) -- pass
-    active_only=False to see everything, e.g. for debugging.
+    a flat, unpaginated `costCenters` array. The endpoint now also supports
+    an optional `state=active` query parameter server-side, so that's
+    passed when active_only=True to avoid pulling archived/deleted cost
+    centers over the wire at all. Each object still carries its own `state`
+    field too, so a client-side filter is kept as a safety net in case the
+    query param is ever ignored or a cost center comes back without a
+    `state` value. Pass active_only=False to see everything, e.g. for
+    debugging.
     """
     url = f"{base_url()}/enterprises/{enterprise}/settings/billing/cost-centers"
+    params = {"per_page": 100}
+    if active_only:
+        params["state"] = "active"
+
     all_cost_centers = []
     page = 1
     while True:
-        resp = session.get(url, params={"per_page": 100, "page": page})
+        params["page"] = page
+        resp = session.get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
         batch = data.get("costCenters", [])
@@ -433,7 +473,9 @@ def fetch_cost_centers(session, enterprise, active_only=True):
     dropped = len(all_cost_centers) - len(active)
     if dropped:
         dropped_names = [cc.get("name") for cc in all_cost_centers if cc not in active]
-        print(f"  Excluded {dropped} non-active cost center(s): {dropped_names}", file=sys.stderr)
+        print(f"  Excluded {dropped} non-active cost center(s) (client-side safety net "
+              f"-- the state=active filter should normally prevent these from being "
+              f"returned at all): {dropped_names}", file=sys.stderr)
     return active
 
 
@@ -515,6 +557,57 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
 # Step 5: write the four-section CSV
 # ---------------------------------------------------------------------------
 
+def match_cost_center_users(cc_names, cc_users):
+    """
+    cc_names come from the ai_credit/usage cost-center list (the
+    authoritative source for credit totals); cc_users is keyed by whatever
+    cost_center_name string showed up in the separate `detailed` CSV
+    export. These are two independent API calls, so a cost center that's
+    real and has credit usage can still fail to line up on an exact string
+    match (case, extra whitespace beyond a plain .strip(), a rename between
+    calls, etc.) -- and silently showing "0" for Unique Users in that case
+    looks like valid data instead of a join miss.
+
+    Matches first by exact name, then falls back to a case/space-normalized
+    match. Any cc_name that still can't be matched to a detailed-report
+    cost center is reported via a warning rather than silently defaulted to
+    0, and the caller decides what to show.
+
+    Returns {cc_name: user_count_or_None}. None means "no match found" --
+    the caller is responsible for rendering that distinctly from a real 0.
+    """
+    def _norm(s):
+        return " ".join((s or "").strip().lower().split())
+
+    normalized_index = {}
+    for name, count in cc_users.items():
+        normalized_index.setdefault(_norm(name), []).append((name, count))
+
+    resolved = {}
+    for cc_name in cc_names:
+        if cc_name in cc_users:
+            resolved[cc_name] = cc_users[cc_name]
+            continue
+        candidates = normalized_index.get(_norm(cc_name), [])
+        if len(candidates) == 1:
+            matched_name, count = candidates[0]
+            print(f"  NOTE: matched cost center '{cc_name}' (credit usage) to "
+                  f"'{matched_name}' (detailed report) by normalized name -- exact "
+                  f"strings differed.", file=sys.stderr)
+            resolved[cc_name] = count
+        elif len(candidates) > 1:
+            print(f"  WARNING: cost center '{cc_name}' has {len(candidates)} ambiguous "
+                  f"normalized-name matches in the detailed report {[c[0] for c in candidates]}. "
+                  f"Unique Users left blank for this row -- investigate separately.", file=sys.stderr)
+            resolved[cc_name] = None
+        else:
+            print(f"  WARNING: cost center '{cc_name}' has AI credit usage but no matching "
+                  f"entry in the detailed report -- Unique Users can't be determined for it "
+                  f"(shown as blank, not 0).", file=sys.stderr)
+            resolved[cc_name] = None
+    return resolved
+
+
 def write_report(output_path, detailed_agg, model_credits, model_additional, cc_api_credits, cc_additional,
                  enterprise_total, enterprise_additional, total_licensed_users, total_allocated_credits,
                  year, month, unrecognized_plans=None):
@@ -539,12 +632,15 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
 
         writer.writerow(["COST CENTER WISE AI CREDIT USAGE"])
         writer.writerow(["Cost Center", "Total AI Credits", "Additional AI Credits", "Unique Users", "% of Total Credits"])
+        cc_user_counts = match_cost_center_users(cc_api_credits.keys(), detailed_agg["cc_users"])
         for cc_name in sorted(cc_api_credits, key=lambda k: -cc_api_credits[k]):
             credits_ = cc_api_credits[cc_name]
             additional_ = cc_additional.get(cc_name, 0.0)
             pct = (credits_ / enterprise_total * 100) if enterprise_total else 0
+            user_count = cc_user_counts.get(cc_name)
+            user_display = user_count if user_count is not None else "(unmatched)"
             writer.writerow([cc_name, f"{credits_:,.2f}", f"{additional_:,.2f}",
-                              detailed_agg["cc_users"].get(cc_name, 0), f"{pct:.2f}%"])
+                              user_display, f"{pct:.2f}%"])
         writer.writerow(["TOTAL", f"{enterprise_total:,.2f}", f"{enterprise_additional:,.2f}",
                           detailed_agg["total_unique_users"], "100.00%"])
         writer.writerow([])
@@ -584,6 +680,7 @@ def main():
         print(f"NOTE: {year}-{month:02d} isn't finished yet — reporting {start_date} to {end_date} "
               f"only (partial month).")
 
+    warn_if_unsupported_token(args.token)
     session = make_session(args.token)
 
     if args.save_raw_dir:
