@@ -382,7 +382,7 @@ def aggregate_detailed(csv_text):
         "total_credits": total_credits,
         "total_unique_users": len(all_users),
         "total_transactions": len(rows),
-        "cc_credits": {k: v for k, v in cc_credits.items() if v > 0},
+        "cc_credits": {k: v for k, v in cc_credits.items() if v > 0.0},
         "cc_users": {k: len(v) for k, v in cc_users.items()},
         "headers": reader.fieldnames,
     }
@@ -575,13 +575,13 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
 
         writer.writerow(["COST CENTER AND AI MODEL WISE AI CREDIT USAGE"])
         writer.writerow(["Cost Center", "Model Name", "Total AI Credits", "Additional AI Credits", "% of Total Credits"])
-        for (cc_name, model) in sorted(cc_model_credits, key=lambda k: (-cc_model_credits[k], k[0], k[1])):
-            credits_ = cc_model_credits[(cc_name, model)]
+        for (cc_name, model), credits_ in sorted(cc_model_credits.items(),
+                                                  key=lambda item: (-item[1], item[0][0], item[0][1])):
             additional_ = cc_model_additional.get((cc_name, model), 0.0)
             pct = (credits_ / enterprise_total * 100) if enterprise_total else 0
             writer.writerow([cc_name, model, f"{credits_:,.2f}", f"{additional_:,.2f}", f"{pct:.2f}%"])
         cc_model_additional_total = sum(cc_model_additional.values())
-        writer.writerow(["TOTAL", "", f"{enterprise_total:,.2f}", f"{cc_model_additional_total:,.2f}", "100.00%"])
+        writer.writerow(["TOTAL", "ALL MODELS", f"{enterprise_total:,.2f}", f"{cc_model_additional_total:,.2f}", "100.00%"])
 
 
 def main():
@@ -641,7 +641,7 @@ def main():
               f"report type and may not exactly match the billing UI; additional-credits "
               f"figures won't be available in this fallback).", file=sys.stderr)
         # detailed_agg["cc_credits"] already has 0-credit entries filtered out
-        cc_api_credits = {k: v for k, v in detailed_agg["cc_credits"].items() if v > 0}
+        cc_api_credits = detailed_agg["cc_credits"]
         cc_additional = {}
         model_credits = {"(Model Breakdown Unavailable)": detailed_agg["total_credits"]}
         model_additional = {}
