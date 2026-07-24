@@ -20,13 +20,25 @@ AI credit quantities for both the COST CENTER WISE and MODEL WISE sections
 come from the same endpoint GitHub's own billing UI uses:
 
   GET /enterprises/{enterprise}/settings/billing/ai_credit/usage
-      ?year=...&month=...                       # enterprise-wide
-      ?year=...&month=...&cost_center_id=<id>   # per cost center
-      ?year=...&month=...&cost_center_id=none   # unassigned usage
+      ?year=...&month=...&cost_center_id=<id>   # per cost center (looped over ALL cost centers)
+      ?year=...&month=...&cost_center_id=none   # usage not assigned to any cost center
 
-This ensures that every credit total in the report (line 5, the cost-center
-TOTAL on line 17, and the model TOTAL) derives from the same data source and
-therefore shows the same number.
+Every cost center returned by the cost-centers list is queried and
+included in the report, even ones with zero usage this period -- an
+earlier version silently dropped any cost center whose usage came back
+as 0, which is what caused "only 3 of 5 cost centers" showing up.
+
+The enterprise-wide total and the MODEL WISE breakdown are built by
+SUMMING every one of those per-bucket calls, rather than by making a
+separate unfiltered call to the same endpoint. GitHub's billing docs note
+that for these usage endpoints, omitting the cost_center_id filter
+returns only usage NOT belonging to any cost center -- not a grand total
+-- so relying on an unfiltered call for "everything" would silently
+under-report both the overall total and the model breakdown. Building
+totals by summing the per-bucket calls avoids depending on that
+undocumented behavior, and guarantees the COST CENTER WISE total, the
+MODEL WISE total, and "Total AI Credits Used" always reconcile exactly,
+by construction.
 
 Unique-users counts per cost center still come from the `detailed` report
 export, which carries per-row user information:
@@ -389,29 +401,23 @@ def fetch_ai_credit_usage_by_model(session, enterprise, year, month, cost_center
     return resp.json().get("usageItems", [])
 
 
-def aggregate_model_usage(usage_items):
-    """
-    grossQuantity is the total AI credits consumed by that model for the
-    period (included-pool usage + any additional/overage usage combined),
-    matching the 'Included credits' + 'Additional credits' columns shown
-    in the billing UI's per-model table.
-    """
-    model_credits = {}
-    for item in usage_items:
-        model = (item.get("model") or "").strip() or "(No model)"
-        gross_qty = float(item.get("grossQuantity") or 0)
-        model_credits[model] = model_credits.get(model, 0.0) + gross_qty
-    return {"model_credits": model_credits}
-
-
 def fetch_cost_centers(session, enterprise):
-    """Returns list of active cost centers, each as a dict with 'id' and 'name'.
-    Handles pagination so all cost centers are fetched regardless of page size."""
+    """
+    Returns ALL cost centers regardless of state. GitHub's documented
+    response for this endpoint is a flat, unpaginated `costCenters` array
+    with no documented `state` filter query param -- an earlier version of
+    this script passed `state=active`, which (if the API doesn't actually
+    support that filter) does nothing, but if it DOES filter, it would
+    silently drop any archived/renamed cost center that still had real
+    usage during the reported month. Dropped here to be safe; pagination
+    params are kept defensively in case a future API version paginates,
+    but are harmless no-ops if it doesn't.
+    """
     url = f"{base_url()}/enterprises/{enterprise}/settings/billing/cost-centers"
     all_cost_centers = []
     page = 1
     while True:
-        resp = session.get(url, params={"state": "active", "per_page": 100, "page": page})
+        resp = session.get(url, params={"per_page": 100, "page": page})
         resp.raise_for_status()
         data = resp.json()
         batch = data.get("costCenters", [])
@@ -422,31 +428,73 @@ def fetch_cost_centers(session, enterprise):
     return all_cost_centers
 
 
-def aggregate_cost_center_credits(session, enterprise, year, month, cost_centers):
+def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
     """
-    Fetches AI credit usage per cost center using the ai_credit/usage endpoint
-    (same source as GitHub's billing UI), ensuring accurate per-cost-center
-    credit totals. Returns {cost_center_name: total_credits}.
+    Fetches AI credit usage per cost center via the ai_credit/usage endpoint
+    (same source as GitHub's billing UI), PLUS a separate call for usage not
+    associated with any cost center. Returns (cc_credits, model_credits):
+
+      cc_credits: {cost_center_name: total_credits} -- EVERY cost center is
+        included, even ones with 0 credits this period, so a zero-usage cost
+        center shows up as a 0.00 row instead of silently disappearing (that
+        silent-drop was the actual cause of "only 3 of 5 cost centers"
+        showing up -- a `if total > 0` check was skipping any cost center
+        the API returned zero usage for).
+
+      model_credits: {model_name: total_credits} -- built by summing every
+        bucket's line items as we go, rather than trusting a single
+        unfiltered call to ai_credit/usage as "the enterprise total". GitHub's
+        own billing docs state that for these usage endpoints, omitting a
+        cost_center_id filter returns only usage NOT belonging to any cost
+        center -- not a grand total -- so a prior version of this script may
+        have been under-reporting both the overall total and the model
+        breakdown by only capturing unassigned usage. Summing every bucket
+        explicitly avoids depending on that undocumented behavior at all,
+        and guarantees the COST CENTER WISE and MODEL WISE totals reconcile
+        by construction.
+
+    Any single cost center's API call failing is caught and logged, rather
+    than silently vanishing or aborting the whole report.
     """
     cc_credits = {}
+    model_credits = {}
 
     for cc in cost_centers:
         cc_id = cc.get("id")
         cc_name = (cc.get("name") or "").strip() or "(Unnamed Cost Center)"
-        items = fetch_ai_credit_usage_by_model(session, enterprise, year, month, cost_center_id=cc_id)
-        total = sum(float(item.get("grossQuantity") or 0) for item in items)
-        if total > 0:
-            cc_credits[cc_name] = cc_credits.get(cc_name, 0.0) + total
+        try:
+            items = fetch_ai_credit_usage_by_model(session, enterprise, year, month, cost_center_id=cc_id)
+        except Exception as e:
+            print(f"  WARNING: couldn't fetch usage for cost center '{cc_name}' (id={cc_id}): {e}. "
+                  f"It will show as 0.00 in the report -- investigate separately.", file=sys.stderr)
+            cc_credits[cc_name] = cc_credits.get(cc_name, 0.0)
+            continue
 
-    # Unassigned usage (not associated with any cost center)
-    unassigned_items = fetch_ai_credit_usage_by_model(
-        session, enterprise, year, month, cost_center_id="none"
-    )
-    unassigned_total = sum(float(item.get("grossQuantity") or 0) for item in unassigned_items)
-    if unassigned_total > 0:
-        cc_credits["(Not Assigned)"] = unassigned_total
+        total = 0.0
+        for item in items:
+            qty = float(item.get("grossQuantity") or 0)
+            total += qty
+            model = (item.get("model") or "").strip() or "(No model)"
+            model_credits[model] = model_credits.get(model, 0.0) + qty
+        cc_credits[cc_name] = cc_credits.get(cc_name, 0.0) + total  # always set, even if total == 0
 
-    return cc_credits
+    try:
+        unassigned_items = fetch_ai_credit_usage_by_model(session, enterprise, year, month, cost_center_id="none")
+    except Exception as e:
+        print(f"  WARNING: couldn't fetch unassigned (no cost center) usage: {e}. "
+              f"Treating it as 0.00 -- the enterprise total below may be understated.", file=sys.stderr)
+        unassigned_items = []
+
+    unassigned_total = 0.0
+    for item in unassigned_items:
+        qty = float(item.get("grossQuantity") or 0)
+        unassigned_total += qty
+        model = (item.get("model") or "").strip() or "(No model)"
+        model_credits[model] = model_credits.get(model, 0.0) + qty
+    cc_credits["(Not Assigned)"] = cc_credits.get("(Not Assigned)", 0.0) + unassigned_total
+
+    print(f"  Cost centers found: {len(cost_centers)}. Rows in report (incl. Not Assigned): {len(cc_credits)}.")
+    return cc_credits, model_credits
 
 
 # ---------------------------------------------------------------------------
@@ -528,31 +576,24 @@ def main():
     detailed_csv = fetch_report_csv(session, args.enterprise, "detailed", start_date, end_date, detailed_raw_path)
     detailed_agg = aggregate_detailed(detailed_csv)
 
-    # Enterprise-wide ai_credit/usage: authoritative source for all credit totals
-    print("Fetching enterprise-wide AI credit usage (model breakdown)...")
-    try:
-        usage_items = fetch_ai_credit_usage_by_model(session, args.enterprise, year, month)
-        model_agg = aggregate_model_usage(usage_items)
-        enterprise_total = sum(model_agg["model_credits"].values())
-        if not model_agg["model_credits"]:
-            print("  WARNING: ai_credit/usage returned no usageItems for this month.", file=sys.stderr)
-            enterprise_total = detailed_agg["total_credits"]
-    except Exception as e:
-        print(f"  WARNING: couldn't get model-wise breakdown ({e}). "
-              f"Falling back to detailed report total.", file=sys.stderr)
-        model_agg = {"model_credits": {"(Model Breakdown Unavailable)": detailed_agg["total_credits"]}}
-        enterprise_total = detailed_agg["total_credits"]
-
-    # Per-cost-center credits from ai_credit/usage (matches GitHub billing UI)
+    # Per-cost-center AND model credits from ai_credit/usage, built together
+    # from the same set of calls so the two sections always reconcile.
     print("Fetching cost centers...")
     try:
         cost_centers = fetch_cost_centers(session, args.enterprise)
-        print(f"  Found {len(cost_centers)} active cost center(s). Fetching usage per cost center...")
-        cc_api_credits = aggregate_cost_center_credits(session, args.enterprise, year, month, cost_centers)
+        print(f"  Found {len(cost_centers)} cost center(s): {[c.get('name') for c in cost_centers]}")
+        cc_api_credits, model_credits = build_usage_by_bucket(session, args.enterprise, year, month, cost_centers)
+        enterprise_total = sum(cc_api_credits.values())
+        model_agg = {"model_credits": model_credits}
+        if not model_credits:
+            print("  WARNING: no usageItems came back for any bucket this month.", file=sys.stderr)
     except Exception as e:
-        print(f"  WARNING: couldn't get per-cost-center breakdown ({e}). "
-              f"Falling back to detailed report for cost center credits.", file=sys.stderr)
+        print(f"  WARNING: couldn't get cost-center/model breakdown ({e}). "
+              f"Falling back to detailed report totals (these come from a different "
+              f"report type and may not exactly match the billing UI).", file=sys.stderr)
         cc_api_credits = detailed_agg["cc_credits"]
+        model_agg = {"model_credits": {"(Model Breakdown Unavailable)": detailed_agg["total_credits"]}}
+        enterprise_total = detailed_agg["total_credits"]
 
     print("Fetching licensed seats...")
     seats = fetch_all_seats(session, args.enterprise)
