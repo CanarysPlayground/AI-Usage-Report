@@ -405,11 +405,21 @@ def aggregate_model_usage(usage_items):
 
 
 def fetch_cost_centers(session, enterprise):
-    """Returns list of active cost centers, each as a dict with 'id' and 'name'."""
+    """Returns list of active cost centers, each as a dict with 'id' and 'name'.
+    Handles pagination so all cost centers are fetched regardless of page size."""
     url = f"{base_url()}/enterprises/{enterprise}/settings/billing/cost-centers"
-    resp = session.get(url, params={"state": "active"})
-    resp.raise_for_status()
-    return resp.json().get("costCenters", [])
+    all_cost_centers = []
+    page = 1
+    while True:
+        resp = session.get(url, params={"state": "active", "per_page": 100, "page": page})
+        resp.raise_for_status()
+        data = resp.json()
+        batch = data.get("costCenters", [])
+        all_cost_centers.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return all_cost_centers
 
 
 def aggregate_cost_center_credits(session, enterprise, year, month, cost_centers):
