@@ -181,11 +181,6 @@ def download_report_csv(download_url):
     # and returns 403.
     resp = requests.get(download_url)
     resp.raise_for_status()
-    # requests falls back to ISO-8859-1 when the response has no explicit
-    # charset, which silently mangles any non-ASCII bytes (this is the
-    # same class of bug that caused the mojibake in the report title —
-    # force UTF-8 here too rather than trusting the guess).
-    resp.encoding = "utf-8"
     return resp.text
 
 
@@ -361,8 +356,6 @@ def aggregate_detailed(csv_text):
     all_users = set()
     cc_credits = {}
     cc_users = {}
-    model_transactions = {}
-    has_model_col = "model" in cols
 
     for r in rows:
         qty = float(r.get(cols["quantity"]) or 0)
@@ -377,38 +370,21 @@ def aggregate_detailed(csv_text):
         if username:
             cc_users.setdefault(cc_name, set()).add(username)
 
-        if has_model_col:
-            model_name = (r.get(cols["model"], "") or "").strip() or "(No model)"
-            model_transactions[model_name] = model_transactions.get(model_name, 0) + 1
-
     return {
         "total_credits": total_credits,
         "total_unique_users": len(all_users),
         "total_transactions": len(rows),
-        # Credit totals per cost center from THIS export — kept only as a
-        # cross-check against the authoritative ai_credit/usage numbers
-        # used in the report; not used directly for the CSV output anymore.
         "cc_credits": cc_credits,
         "cc_users": {k: len(v) for k, v in cc_users.items()},
-        # Only populated if the detailed export actually carries a `model`
-        # column for this account/period; otherwise stays empty and the
-        # report falls back to "N/A" for per-model transaction counts.
-        "model_transactions": model_transactions,
         "headers": reader.fieldnames,
     }
 
 
-def fetch_ai_credit_usage_items(session, enterprise, year, month):
+def fetch_ai_credit_usage_by_model(session, enterprise, year, month):
     """
-    The same endpoint behind GitHub's own 'AI usage' billing page — this is
-    what that page queries whether you're looking at it grouped by Model
-    or grouped by Cost Center; the raw usageItems carry both a `model`
-    field and a cost-center field per line item. We fetch it once and
-    aggregate it two ways (by model, by cost center) instead of trying to
-    re-derive cost-center totals from the separate `detailed` export,
-    which does its own independent (and not always identical) cost-center
-    attribution. Using this endpoint for BOTH sections is what keeps the
-    numbers matching exactly what's shown on the billing UI.
+    The same endpoint behind GitHub's own 'AI usage' billing page when
+    grouped by Model. Returns usageItems already aggregated per model for
+    the given month — no cost_center_id filter means enterprise-wide.
     """
     url = f"{base_url()}/enterprises/{enterprise}/settings/billing/ai_credit/usage"
     resp = session.get(url, params={"year": year, "month": month})
@@ -416,31 +392,13 @@ def fetch_ai_credit_usage_items(session, enterprise, year, month):
     return resp.json().get("usageItems", [])
 
 
-# Real payloads have been observed to name the cost-center field a couple
-# of different ways depending on API version — same defensive pattern as
-# resolve_columns() below, just for JSON keys instead of CSV headers.
-COST_CENTER_ITEM_KEY_CANDIDATES = ["costCenterName", "cost_center_name", "costCenter", "cost_center"]
-
-
-def _item_cost_center_name(item):
-    for key in COST_CENTER_ITEM_KEY_CANDIDATES:
-        if key in item:
-            name = (item.get(key) or "").strip()
-            if name:
-                return name
-    return "(Not Assigned)"
-
-
 def aggregate_model_usage(usage_items):
     """
     grossQuantity is the total AI credits consumed by that model for the
     period (included-pool usage + any additional/overage usage combined),
     matching the 'Included credits' + 'Additional credits' columns shown
-    in the billing UI's per-model table. This endpoint doesn't expose a
-    per-model transaction count directly, so the "Transactions" column is
-    filled in later from the `detailed` export's own `model` column when
-    that export happens to carry one (see aggregate_detailed) — falling
-    back to "N/A" only if neither source has it.
+    in the billing UI's per-model table. There's no per-model transaction
+    count exposed by this endpoint, so "Transactions" is reported as N/A.
     """
     model_credits = {}
     for item in usage_items:
@@ -450,43 +408,18 @@ def aggregate_model_usage(usage_items):
     return {"model_credits": model_credits}
 
 
-def aggregate_cost_center_usage(usage_items):
-    """
-    Cost-center credit totals from the SAME authoritative endpoint as the
-    model breakdown, so these numbers reconcile exactly with what's shown
-    in GitHub's own 'Usage breakdown' UI grouped by Cost Center. This
-    intentionally does NOT come from the `detailed` export — that export's
-    per-row cost-center attribution can drift from this endpoint's (e.g. a
-    user moved between cost centers mid-month), which is what caused a
-    cost center's credit total to come out wrong previously. Unique-user
-    counts still come from the `detailed` export separately, since this
-    endpoint only returns pre-aggregated totals, not per-user rows.
-    """
-    cc_credits = {}
-    for item in usage_items:
-        cc_name = _item_cost_center_name(item)
-        gross_qty = float(item.get("grossQuantity") or 0)
-        cc_credits[cc_name] = cc_credits.get(cc_name, 0.0) + gross_qty
-    return {"cc_credits": cc_credits}
-
-
 # ---------------------------------------------------------------------------
 # Step 5: write the three-section CSV
 # ---------------------------------------------------------------------------
 
-def write_report(output_path, detailed_agg, model_agg, cc_agg, total_licensed_users,
+def write_report(output_path, detailed_agg, model_agg, total_licensed_users,
                   total_allocated_credits, year, month, unrecognized_plans=None):
     total_credits = detailed_agg["total_credits"]
 
-    # utf-8-sig writes a BOM so Excel/Sheets correctly detect UTF-8 instead
-    # of falling back to a legacy codepage (that fallback is what turned a
-    # plain "-" into "â€"" in earlier reports whenever the title used a
-    # non-ASCII dash) — kept even though the title below is now pure ASCII,
-    # since cost center / model names could contain non-ASCII characters.
-    with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+    with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
 
-        writer.writerow([f"Copilot AI Usage Report - {year}-{month:02d}"])
+        writer.writerow([f"Copilot AI Usage Report — {year}-{month:02d}"])
         writer.writerow([])
 
         writer.writerow(["OVERALL METRICS"])
@@ -501,21 +434,13 @@ def write_report(output_path, detailed_agg, model_agg, cc_agg, total_licensed_us
             ])
         writer.writerow([])
 
-        # Credits here come from the ai_credit/usage endpoint (cc_agg) —
-        # the same authoritative source as the billing UI's own "Usage
-        # breakdown" table — not from the detailed export, so these totals
-        # reconcile exactly with what you see on github.com. Unique Users
-        # still comes from the detailed export, which is the only source
-        # that has per-user rows.
         writer.writerow(["COST CENTER WISE AI CREDIT USAGE"])
         writer.writerow(["Cost Center", "Total AI Credits", "Unique Users", "% of Total Credits"])
-        cc_credits = cc_agg["cc_credits"]
-        cc_total_credits = sum(cc_credits.values())
-        for cc_name in sorted(cc_credits, key=lambda k: -cc_credits[k]):
-            credits_ = cc_credits[cc_name]
-            pct = (credits_ / cc_total_credits * 100) if cc_total_credits else 0
+        for cc_name in sorted(detailed_agg["cc_credits"], key=lambda k: -detailed_agg["cc_credits"][k]):
+            credits_ = detailed_agg["cc_credits"][cc_name]
+            pct = (credits_ / total_credits * 100) if total_credits else 0
             writer.writerow([cc_name, f"{credits_:,.2f}", detailed_agg["cc_users"].get(cc_name, 0), f"{pct:.2f}%"])
-        writer.writerow(["TOTAL", f"{cc_total_credits:,.2f}", detailed_agg["total_unique_users"], "100.00%"])
+        writer.writerow(["TOTAL", f"{total_credits:,.2f}", detailed_agg["total_unique_users"], "100.00%"])
         writer.writerow([])
 
         writer.writerow(["MODEL WISE AI CREDIT USAGE"])
@@ -523,14 +448,11 @@ def write_report(output_path, detailed_agg, model_agg, cc_agg, total_licensed_us
         model_credits = model_agg["model_credits"]
         model_total_credits = sum(model_credits.values())
         pct_base = model_total_credits or total_credits
-        model_transactions = detailed_agg.get("model_transactions") or {}
-        total_model_transactions = sum(model_transactions.values()) if model_transactions else "N/A"
         for model in sorted(model_credits, key=lambda k: -model_credits[k]):
             credits_ = model_credits[model]
             pct = (credits_ / pct_base * 100) if pct_base else 0
-            txns = model_transactions.get(model, "N/A") if model_transactions else "N/A"
-            writer.writerow([model, f"{credits_:,.2f}", txns, f"{pct:.2f}%"])
-        writer.writerow(["TOTAL", f"{model_total_credits:,.2f}", total_model_transactions, "100.00%"])
+            writer.writerow([model, f"{credits_:,.2f}", "N/A", f"{pct:.2f}%"])
+        writer.writerow(["TOTAL", f"{model_total_credits:,.2f}", "N/A", "100.00%"])
 
 
 def main():
@@ -568,32 +490,16 @@ def main():
     detailed_csv = fetch_report_csv(session, args.enterprise, "detailed", start_date, end_date, detailed_raw_path)
     detailed_agg = aggregate_detailed(detailed_csv)
 
-    print("Fetching AI credit usage (model + cost center breakdowns)...")
+    print("Fetching model-wise AI credit usage...")
     try:
-        usage_items = fetch_ai_credit_usage_items(session, args.enterprise, year, month)
+        usage_items = fetch_ai_credit_usage_by_model(session, args.enterprise, year, month)
         model_agg = aggregate_model_usage(usage_items)
-        cc_agg = aggregate_cost_center_usage(usage_items)
         if not model_agg["model_credits"]:
             print("  WARNING: ai_credit/usage returned no usageItems for this month.", file=sys.stderr)
-        else:
-            # Sanity check against the detailed export's own (independent)
-            # cost-center attribution — a mismatch here just confirms the
-            # two sources disagree for a given cost center, which is
-            # expected occasionally; it doesn't mean either number is
-            # wrong, just that ai_credit/usage (used in the report) is the
-            # one that matches the billing UI.
-            for cc_name, credits_ in cc_agg["cc_credits"].items():
-                detailed_credits = detailed_agg["cc_credits"].get(cc_name)
-                if detailed_credits is not None and abs(detailed_credits - credits_) > 0.01:
-                    print(f"  NOTE: '{cc_name}' differs between sources — "
-                          f"ai_credit/usage: {credits_:,.2f}, detailed export: {detailed_credits:,.2f}. "
-                          f"Using ai_credit/usage (matches billing UI).", file=sys.stderr)
     except Exception as e:
-        print(f"  WARNING: couldn't get ai_credit/usage breakdown ({e}). "
-              f"Model and cost-center sections will fall back to the detailed export's own totals.",
-              file=sys.stderr)
+        print(f"  WARNING: couldn't get model-wise breakdown ({e}). "
+              f"Model section will show a single unattributed total.", file=sys.stderr)
         model_agg = {"model_credits": {"(model breakdown unavailable)": detailed_agg["total_credits"]}}
-        cc_agg = {"cc_credits": detailed_agg["cc_credits"]}
 
     print("Fetching licensed seats...")
     seats = fetch_all_seats(session, args.enterprise)
@@ -605,7 +511,7 @@ def main():
               f"PROMO_INCLUDED_CREDITS if they're valid Copilot plans.", file=sys.stderr)
 
     output_path = args.output or f"copilot_ai_usage_{year}-{month:02d}.csv"
-    write_report(output_path, detailed_agg, model_agg, cc_agg, total_licensed_users,
+    write_report(output_path, detailed_agg, model_agg, total_licensed_users,
                  total_allocated_credits, year, month, unrecognized_plans=unrecognized_plans)
 
     print(f"\nDone. Report written to {output_path}")
