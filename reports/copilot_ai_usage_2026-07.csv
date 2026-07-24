@@ -1,4 +1,4 @@
-﻿Copilot AI Usage Report - 2026-07
+Copilot AI Usage Report — 2026-07
 
 OVERALL METRICS
 Total Allocated Credits,"61,000.00"
@@ -9,15 +9,19 @@ Total Transactions,168
 
 COST CENTER WISE AI CREDIT USAGE
 Cost Center,Total AI Credits,Unique Users,% of Total Credits
-(Not Assigned),"58,359.55",12,100.00%
-TOTAL,"58,359.55",16,100.00%
+(Not Assigned),"18,166.29",12,31.56%
+TestCC-July,"14,324.60",8,24.89%
+PowerUsers-$20,"12,992.30",2,22.57%
+Power Users,"11,430.42",3,19.86%
+Copilot-Budget-AK-NK,642.16,1,1.12%
+TOTAL,"57,555.77",16,100.00%
 
 MODEL WISE AI CREDIT USAGE
 Model Name,Total AI Credits,Transactions,% of Total Credits
-Claude Sonnet 4.6,"35,996.06",N/A,61.68%
-Coding Agent model,"9,345.01",N/A,16.01%
-Claude Haiku 4.5,"4,820.96",N/A,8.26%
-Claude Opus 4.6,"3,378.83",N/A,5.79%
+Claude Sonnet 4.6,"36,029.43",N/A,61.66%
+Coding Agent model,"9,386.01",N/A,16.06%
+Claude Haiku 4.5,"4,820.96",N/A,8.25%
+Claude Opus 4.6,"3,378.83",N/A,5.78%
 Auto: GPT-5.3-Codex,"2,744.44",N/A,4.70%
 GPT-5.4 mini,515.74,N/A,0.88%
 Claude Sonnet 4.5,415.35,N/A,0.71%
@@ -29,4 +33,4 @@ Code Review model,94.14,N/A,0.16%
 Auto: GPT-5.4 mini,87.36,N/A,0.15%
 GPT-5.3-Codex,50.21,N/A,0.09%
 MAI-Code-1-Flash,26.93,N/A,0.05%
-TOTAL,"58,359.55",N/A,100.00%
+TOTAL,"58,433.93",N/A,100.00%
