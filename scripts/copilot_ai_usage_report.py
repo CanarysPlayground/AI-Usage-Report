@@ -422,7 +422,7 @@ def aggregate_cost_center_credits(session, enterprise, year, month, cost_centers
 
     for cc in cost_centers:
         cc_id = cc.get("id")
-        cc_name = (cc.get("name") or "").strip() or f"(Cost Center {cc_id})"
+        cc_name = (cc.get("name") or "").strip() or "(Unnamed Cost Center)"
         items = fetch_ai_credit_usage_by_model(session, enterprise, year, month, cost_center_id=cc_id)
         total = sum(float(item.get("grossQuantity") or 0) for item in items)
         if total > 0:
@@ -530,7 +530,7 @@ def main():
     except Exception as e:
         print(f"  WARNING: couldn't get model-wise breakdown ({e}). "
               f"Falling back to detailed report total.", file=sys.stderr)
-        model_agg = {"model_credits": {"(model breakdown unavailable)": detailed_agg["total_credits"]}}
+        model_agg = {"model_credits": {"(Model Breakdown Unavailable)": detailed_agg["total_credits"]}}
         enterprise_total = detailed_agg["total_credits"]
 
     # Per-cost-center credits from ai_credit/usage (matches GitHub billing UI)
