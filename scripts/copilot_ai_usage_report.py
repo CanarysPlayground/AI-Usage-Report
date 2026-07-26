@@ -492,7 +492,7 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
 
       cc_additional / model_additional: {name: additional_credits} -- just
         the portion billed BEYOND the included pool, i.e. each item's
-        `netQuantity` (matches the billing UI's "Additional AI Credits"
+        `netQuantity` (matches the billing UI's "Additional credits"
         column; 0 for a cost center/model that stayed within its included
         allotment).
 
@@ -509,26 +509,43 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
     that undocumented behavior, and guarantees the COST CENTER WISE and
     MODEL WISE totals reconcile by construction.
 
+    Cost centers are keyed internally by their ID, not their display name.
+    GitHub lets two cost centers share the same name (a rename, or a
+    recreated cost center), and keying by name would silently merge their
+    usage into a single row -- which would make that row's credits correct
+    in aggregate but wrongly attributed, and would understate how many
+    distinct cost centers actually have usage. Keying by ID first and only
+    falling back to the display name at the very end (disambiguating with
+    the ID if two live cost centers do share a name) avoids that.
+
     Any single cost center's API call failing is caught and logged, rather
     than silently vanishing or aborting the whole report.
     """
-    cc_credits, cc_additional = {}, {}
+    # Keyed by cost center id (or a sentinel for "no cost center") so usage
+    # is never merged across two differently-provisioned cost centers that
+    # happen to share a display name.
+    cc_totals_by_id = {}
     model_credits, model_additional = {}, {}
 
-    def _accumulate(items, cc_name):
+    def _accumulate(items):
+        """
+        Accumulates every item unconditionally into the model breakdown --
+        no per-item threshold -- so model_credits/model_additional are
+        built from exactly the same set of items as the cost-center bucket
+        total below, with nothing dropped by one path and kept by the
+        other. Returns this bucket's (total, additional) for the caller to
+        decide whether the bucket itself counts as "real usage".
+        """
         total, additional = 0.0, 0.0
         for item in items:
             gross = float(item.get("grossQuantity") or 0)
             net = float(item.get("netQuantity") or 0)  # portion beyond the included pool
             total += gross
             additional += net
-            if gross > 0:
-                model = (item.get("model") or "").strip() or "(No model)"
-                model_credits[model] = model_credits.get(model, 0.0) + gross
-                model_additional[model] = model_additional.get(model, 0.0) + net
-        if total > 0:
-            cc_credits[cc_name] = cc_credits.get(cc_name, 0.0) + total
-            cc_additional[cc_name] = cc_additional.get(cc_name, 0.0) + additional
+            model = (item.get("model") or "").strip() or "(No model)"
+            model_credits[model] = model_credits.get(model, 0.0) + gross
+            model_additional[model] = model_additional.get(model, 0.0) + net
+        return total, additional
 
     for cc in cost_centers:
         cc_id = cc.get("id")
@@ -539,7 +556,9 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
             print(f"  WARNING: couldn't fetch usage for cost center '{cc_name}' (id={cc_id}): {e}. "
                   f"Excluded from the report -- investigate separately.", file=sys.stderr)
             continue
-        _accumulate(items, cc_name)
+        total, additional = _accumulate(items)
+        if total > 0:
+            cc_totals_by_id[cc_id] = {"name": cc_name, "total": total, "additional": additional}
 
     try:
         unassigned_items = fetch_ai_credit_usage_by_model(session, enterprise, year, month, cost_center_id="none")
@@ -547,7 +566,55 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
         print(f"  WARNING: couldn't fetch unassigned (no cost center) usage: {e}. "
               f"Treating it as 0.00 -- the enterprise total below may be understated.", file=sys.stderr)
         unassigned_items = []
-    _accumulate(unassigned_items, "(Not Assigned)")
+    total, additional = _accumulate(unassigned_items)
+    if total > 0:
+        cc_totals_by_id["__unassigned__"] = {"name": "(Not Assigned)", "total": total, "additional": additional}
+
+    # Model rows with zero net total this period are dropped, matching the
+    # same "only real usage" rule applied to cost centers above.
+    model_credits = {m: v for m, v in model_credits.items() if v > 0}
+    model_additional = {m: model_additional.get(m, 0.0) for m in model_credits}
+
+    # Collapse the id-keyed buckets down to the name-keyed dicts the rest
+    # of the script (and the CSV) works with. If two live cost centers
+    # really do share a display name, disambiguate with the ID rather than
+    # silently summing them into one row.
+    name_counts = {}
+    for info in cc_totals_by_id.values():
+        name_counts[info["name"]] = name_counts.get(info["name"], 0) + 1
+
+    cc_credits, cc_additional = {}, {}
+    for cc_id, info in cc_totals_by_id.items():
+        name = info["name"]
+        if name_counts[name] > 1:
+            display_name = f"{name} (id: {cc_id})"
+            print(f"  NOTE: multiple cost centers with usage share the display name "
+                  f"'{name}' -- showing them separately as '{display_name}' instead of "
+                  f"merging their credits into one row.", file=sys.stderr)
+        else:
+            display_name = name
+        cc_credits[display_name] = info["total"]
+        cc_additional[display_name] = info["additional"]
+
+    # Sanity check: since cc_credits/cc_additional and model_credits/model_additional
+    # are built from the exact same set of API responses, their totals must match.
+    # A mismatch here means the two groupings genuinely disagree on the underlying
+    # data (not just a display bug), so it's surfaced loudly rather than silently
+    # papered over.
+    cc_total_sum = sum(cc_credits.values())
+    model_total_sum = sum(model_credits.values())
+    if abs(cc_total_sum - model_total_sum) > 0.01:
+        print(f"  WARNING: cost-center total ({cc_total_sum:,.2f}) and model total "
+              f"({model_total_sum:,.2f}) disagree by {abs(cc_total_sum - model_total_sum):,.2f} "
+              f"credits. Investigate -- the API responses themselves are inconsistent, "
+              f"this isn't just a display issue.", file=sys.stderr)
+    cc_additional_sum = sum(cc_additional.values())
+    model_additional_sum = sum(model_additional.values())
+    if abs(cc_additional_sum - model_additional_sum) > 0.01:
+        print(f"  WARNING: cost-center additional-credits total ({cc_additional_sum:,.2f}) and "
+              f"model additional-credits total ({model_additional_sum:,.2f}) disagree by "
+              f"{abs(cc_additional_sum - model_additional_sum):,.2f} credits. Investigate.",
+              file=sys.stderr)
 
     print(f"  Cost centers checked: {len(cost_centers)}. Rows with usage in report: {len(cc_credits)}.")
     return cc_credits, cc_additional, model_credits, model_additional
@@ -652,8 +719,12 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
             additional_ = model_additional.get(model, 0.0)
             pct = (credits_ / enterprise_total * 100) if enterprise_total else 0
             writer.writerow([model, f"{credits_:,.2f}", f"{additional_:,.2f}", f"{pct:.2f}%"])
-        model_additional_total = sum(model_additional.values())
-        writer.writerow(["TOTAL", f"{enterprise_total:,.2f}", f"{model_additional_total:,.2f}", "100.00%"])
+        # Reuse the same enterprise_total / enterprise_additional values printed in the
+        # COST CENTER WISE TOTAL row above (rather than independently re-summing
+        # model_credits/model_additional here) so the two TOTAL rows -- and the
+        # OVERALL METRICS "Total AI Credits Used" / "Total Additional AI Credits" --
+        # are guaranteed identical by construction, not just equal in practice.
+        writer.writerow(["TOTAL", f"{enterprise_total:,.2f}", f"{enterprise_additional:,.2f}", "100.00%"])
 
 
 def main():
