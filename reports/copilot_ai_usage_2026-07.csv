@@ -2,34 +2,35 @@
 
 OVERALL METRICS
 Total Allocated Credits,"61,000.00"
-Total AI Credits Used,"45,945.97"
-Total Additional AI Credits (beyond included pool),0.00
+Total AI Credits Used,"47,453.35"
+Total Additional AI Credits (beyond included pool),13.81
 Total Copilot Licensed Users,19
 Total Unique Users,16
 
 COST CENTER WISE AI CREDIT USAGE
 Cost Center,Total AI Credits,Additional AI Credits,Unique Users,% of Total Credits
-(Not Assigned),"18,166.29",0.00,12,39.54%
-TestCC-July,"15,165.79",0.00,8,33.01%
-Power Users,"12,610.74",0.00,3,27.45%
-Org-canarysresource Cost center,3.14,0.00,(unmatched),0.01%
-TOTAL,"45,945.97",0.00,16,100.00%
+(Not Assigned),"18,166.29",0.00,12,38.28%
+TestCC-July,"15,988.75",5.81,8,33.69%
+Power Users,"13,260.91",8.00,3,27.95%
+Org-canarysresource Cost center,34.10,0.00,(unmatched),0.07%
+AI Credits usage,3.30,0.00,1,0.01%
+TOTAL,"47,453.35",13.81,16,100.00%
 
 MODEL WISE AI CREDIT USAGE
 Model Name,Total AI Credits,Additional AI Credits,% of Total Credits
-Claude Sonnet 4.6,"26,340.86",0.00,57.33%
-Coding Agent model,"7,027.95",0.00,15.30%
-Claude Haiku 4.5,"4,720.19",0.00,10.27%
-Claude Opus 4.6,"3,378.83",0.00,7.35%
-Auto: GPT-5.3-Codex,"2,549.99",0.00,5.55%
-GPT-5.4 mini,511.97,0.00,1.11%
-Claude Opus 4.5,367.11,0.00,0.80%
-Claude Sonnet 4.5,337.26,0.00,0.73%
-Auto: Claude Sonnet 4.6,199.47,0.00,0.43%
-Auto: Claude Haiku 4.5,155.55,0.00,0.34%
-GPT-5 mini,125.42,0.00,0.27%
-Auto: GPT-5.4 mini,85.14,0.00,0.19%
-Code Review model,82.29,0.00,0.18%
-GPT-5.3-Codex,36.99,0.00,0.08%
+Claude Sonnet 4.6,"27,068.09",8.00,57.04%
+Coding Agent model,"7,212.35",0.00,15.20%
+Claude Haiku 4.5,"5,115.71",0.00,10.78%
+Claude Opus 4.6,"3,378.83",0.00,7.12%
+Auto: GPT-5.3-Codex,"2,555.80",5.81,5.39%
+GPT-5.4 mini,675.42,0.00,1.42%
+Claude Opus 4.5,367.11,0.00,0.77%
+Claude Sonnet 4.5,337.26,0.00,0.71%
+Auto: Claude Sonnet 4.6,199.47,0.00,0.42%
+Auto: Claude Haiku 4.5,155.55,0.00,0.33%
+GPT-5 mini,125.42,0.00,0.26%
+Auto: GPT-5.4 mini,85.14,0.00,0.18%
+Code Review model,82.29,0.00,0.17%
+GPT-5.3-Codex,67.95,0.00,0.14%
 MAI-Code-1-Flash,26.93,0.00,0.06%
-TOTAL,"45,945.97",0.00,100.00%
+TOTAL,"47,453.35",13.81,100.00%
