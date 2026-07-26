@@ -687,7 +687,9 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
 
         writer.writerow(["OVERALL METRICS"])
         writer.writerow(["Total Allocated Credits", f"{total_allocated_credits:,.2f}"])
-        writer.writerow(["Total AI Credits Used", f"{enterprise_total:,.2f}"])
+        writer.writerow(["Total AI Credits Used (included + additional combined)", f"{enterprise_total:,.2f}"])
+        writer.writerow(["Total Included AI Credits (within pool -- matches the billing UI's \"Included credits\" tile)",
+                          f"{enterprise_total - enterprise_additional:,.2f}"])
         writer.writerow(["Total Additional AI Credits (beyond included pool)", f"{enterprise_additional:,.2f}"])
         writer.writerow(["Total Copilot Licensed Users", total_licensed_users])
         writer.writerow(["Total Unique Users", detailed_agg["total_unique_users"]])
@@ -698,33 +700,38 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
         writer.writerow([])
 
         writer.writerow(["COST CENTER WISE AI CREDIT USAGE"])
-        writer.writerow(["Cost Center", "Total AI Credits", "Additional AI Credits", "Unique Users", "% of Total Credits"])
+        writer.writerow(["Cost Center", "Total AI Credits", "Included AI Credits", "Additional AI Credits",
+                          "Unique Users", "% of Total Credits"])
         cc_user_counts = match_cost_center_users(cc_api_credits.keys(), detailed_agg["cc_users"])
         for cc_name in sorted(cc_api_credits, key=lambda k: -cc_api_credits[k]):
             credits_ = cc_api_credits[cc_name]
             additional_ = cc_additional.get(cc_name, 0.0)
+            included_ = credits_ - additional_
             pct = (credits_ / enterprise_total * 100) if enterprise_total else 0
             user_count = cc_user_counts.get(cc_name)
             user_display = user_count if user_count is not None else "(unmatched)"
-            writer.writerow([cc_name, f"{credits_:,.2f}", f"{additional_:,.2f}",
+            writer.writerow([cc_name, f"{credits_:,.2f}", f"{included_:,.2f}", f"{additional_:,.2f}",
                               user_display, f"{pct:.2f}%"])
-        writer.writerow(["TOTAL", f"{enterprise_total:,.2f}", f"{enterprise_additional:,.2f}",
-                          detailed_agg["total_unique_users"], "100.00%"])
+        writer.writerow(["TOTAL", f"{enterprise_total:,.2f}", f"{enterprise_total - enterprise_additional:,.2f}",
+                          f"{enterprise_additional:,.2f}", detailed_agg["total_unique_users"], "100.00%"])
         writer.writerow([])
 
         writer.writerow(["MODEL WISE AI CREDIT USAGE"])
-        writer.writerow(["Model Name", "Total AI Credits", "Additional AI Credits", "% of Total Credits"])
+        writer.writerow(["Model Name", "Total AI Credits", "Included AI Credits", "Additional AI Credits",
+                          "% of Total Credits"])
         for model in sorted(model_credits, key=lambda k: -model_credits[k]):
             credits_ = model_credits[model]
             additional_ = model_additional.get(model, 0.0)
+            included_ = credits_ - additional_
             pct = (credits_ / enterprise_total * 100) if enterprise_total else 0
-            writer.writerow([model, f"{credits_:,.2f}", f"{additional_:,.2f}", f"{pct:.2f}%"])
+            writer.writerow([model, f"{credits_:,.2f}", f"{included_:,.2f}", f"{additional_:,.2f}", f"{pct:.2f}%"])
         # Reuse the same enterprise_total / enterprise_additional values printed in the
         # COST CENTER WISE TOTAL row above (rather than independently re-summing
         # model_credits/model_additional here) so the two TOTAL rows -- and the
         # OVERALL METRICS "Total AI Credits Used" / "Total Additional AI Credits" --
         # are guaranteed identical by construction, not just equal in practice.
-        writer.writerow(["TOTAL", f"{enterprise_total:,.2f}", f"{enterprise_additional:,.2f}", "100.00%"])
+        writer.writerow(["TOTAL", f"{enterprise_total:,.2f}", f"{enterprise_total - enterprise_additional:,.2f}",
+                          f"{enterprise_additional:,.2f}", "100.00%"])
 
 
 def audit_cost_center_coverage(detailed_cc_credits, cc_api_credits):
