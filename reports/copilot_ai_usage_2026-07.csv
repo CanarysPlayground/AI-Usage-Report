@@ -2,37 +2,38 @@
 
 OVERALL METRICS
 Total Allocated Credits,"61,000.00"
-Total AI Credits Used,"61,038.23"
+Total AI Credits Used (included + additional combined),"61,038.23"
+"Total Included AI Credits (within pool -- matches the billing UI's ""Included credits"" tile)","61,024.42"
 Total Additional AI Credits (beyond included pool),13.81
 Total Copilot Licensed Users,19
 Total Unique Users,16
 
 COST CENTER WISE AI CREDIT USAGE
-Cost Center,Total AI Credits,Additional AI Credits,Unique Users,% of Total Credits
-(Not Assigned),"18,166.29",0.00,12,29.76%
-TestCC-July,"15,988.75",5.81,8,26.19%
-Power Users,"13,260.91",8.00,3,21.73%
-PowerUsers-$20,"12,942.72",0.00,2,21.20%
-Copilot-Budget-AK-NK,642.16,0.00,1,1.05%
-Org-canarysresource Cost center,34.10,0.00,(unmatched),0.06%
-AI Credits usage,3.30,0.00,1,0.01%
-TOTAL,"61,038.23",13.81,16,100.00%
+Cost Center,Total AI Credits,Included AI Credits,Additional AI Credits,Unique Users,% of Total Credits
+(Not Assigned),"18,166.29","18,166.29",0.00,12,29.76%
+TestCC-July,"15,988.75","15,982.94",5.81,8,26.19%
+Power Users,"13,260.91","13,252.90",8.00,3,21.73%
+PowerUsers-$20,"12,942.72","12,942.72",0.00,2,21.20%
+Copilot-Budget-AK-NK,642.16,642.16,0.00,1,1.05%
+Org-canarysresource Cost center,34.10,34.10,0.00,(unmatched),0.06%
+AI Credits usage,3.30,3.30,0.00,1,0.01%
+TOTAL,"61,038.23","61,024.42",13.81,16,100.00%
 
 MODEL WISE AI CREDIT USAGE
-Model Name,Total AI Credits,Additional AI Credits,% of Total Credits
-Claude Sonnet 4.6,"37,388.30",8.00,61.25%
-Coding Agent model,"10,018.61",0.00,16.41%
-Claude Haiku 4.5,"5,216.48",0.00,8.55%
-Claude Opus 4.6,"3,378.83",0.00,5.54%
-Auto: GPT-5.3-Codex,"2,750.25",5.81,4.51%
-GPT-5.4 mini,696.28,0.00,1.14%
-Claude Sonnet 4.5,415.35,0.00,0.68%
-Claude Opus 4.5,367.11,0.00,0.60%
-Auto: Claude Sonnet 4.6,216.43,0.00,0.35%
-Auto: Claude Haiku 4.5,156.22,0.00,0.26%
-GPT-5 mini,144.78,0.00,0.24%
-Code Review model,94.14,0.00,0.15%
-Auto: GPT-5.4 mini,87.36,0.00,0.14%
-GPT-5.3-Codex,81.16,0.00,0.13%
-MAI-Code-1-Flash,26.93,0.00,0.04%
-TOTAL,"61,038.23",13.81,100.00%
+Model Name,Total AI Credits,Included AI Credits,Additional AI Credits,% of Total Credits
+Claude Sonnet 4.6,"37,388.30","37,380.30",8.00,61.25%
+Coding Agent model,"10,018.61","10,018.61",0.00,16.41%
+Claude Haiku 4.5,"5,216.48","5,216.48",0.00,8.55%
+Claude Opus 4.6,"3,378.83","3,378.83",0.00,5.54%
+Auto: GPT-5.3-Codex,"2,750.25","2,744.44",5.81,4.51%
+GPT-5.4 mini,696.28,696.28,0.00,1.14%
+Claude Sonnet 4.5,415.35,415.35,0.00,0.68%
+Claude Opus 4.5,367.11,367.11,0.00,0.60%
+Auto: Claude Sonnet 4.6,216.43,216.43,0.00,0.35%
+Auto: Claude Haiku 4.5,156.22,156.22,0.00,0.26%
+GPT-5 mini,144.78,144.78,0.00,0.24%
+Code Review model,94.14,94.14,0.00,0.15%
+Auto: GPT-5.4 mini,87.36,87.36,0.00,0.14%
+GPT-5.3-Codex,81.16,81.16,0.00,0.13%
+MAI-Code-1-Flash,26.93,26.93,0.00,0.04%
+TOTAL,"61,038.23","61,024.42",13.81,100.00%
