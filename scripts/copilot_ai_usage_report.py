@@ -727,6 +727,48 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
         writer.writerow(["TOTAL", f"{enterprise_total:,.2f}", f"{enterprise_additional:,.2f}", "100.00%"])
 
 
+def audit_cost_center_coverage(detailed_cc_credits, cc_api_credits):
+    """
+    Cross-checks the cost-center names seen in the raw `detailed` export
+    (detailed_cc_credits, already filtered to > 0 usage) against the cost
+    centers that ended up in the ai_credit/usage-based breakdown
+    (cc_api_credits) -- the two come from independent API calls, so this
+    catches a cost center that genuinely has usage but silently never made
+    it into the report at all (e.g. because fetch_cost_centers() didn't
+    return it, or its ai_credit/usage call came back empty for some other
+    reason). That failure mode produces no exception and no existing
+    warning -- the cost center's row just doesn't exist -- so without this
+    check it's invisible until someone manually compares against the
+    billing UI.
+
+    Returns the list of (name, detailed_report_credits) pairs that are
+    missing, and prints a WARNING for each. An empty list means every
+    cost center with real usage in the detailed export is accounted for
+    somewhere in the ai_credit/usage breakdown.
+    """
+    def _norm(s):
+        return " ".join((s or "").strip().lower().split())
+
+    api_normalized = {_norm(k) for k in cc_api_credits}
+    missing = []
+    for name, credits_ in detailed_cc_credits.items():
+        if _norm(name) in api_normalized:
+            continue
+        # Allow for the "(id: xxx)" suffix build_usage_by_bucket adds when
+        # disambiguating two cost centers that share a display name.
+        if any(_norm(k).startswith(_norm(name) + " (id:") for k in cc_api_credits):
+            continue
+        missing.append((name, credits_))
+
+    for name, credits_ in sorted(missing, key=lambda x: -x[1]):
+        print(f"  WARNING: cost center '{name}' shows {credits_:,.2f} credits of usage in the "
+              f"detailed report but does not appear anywhere in the ai_credit/usage cost-center "
+              f"breakdown -- it is MISSING from this report. Check whether fetch_cost_centers() "
+              f"returned this cost center at all, and whether its ai_credit/usage call returned "
+              f"any items.", file=sys.stderr)
+    return missing
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--enterprise", default=os.environ.get("GITHUB_ENTERPRISE"))
@@ -766,19 +808,33 @@ def main():
 
     # Per-cost-center AND model credits (total + additional/overage) from
     # ai_credit/usage, built together from the same set of calls so every
-    # section reconciles. Only active cost centers with real usage (> 0) this
-    # period end up in the report; deleted or inactive cost centers with no
-    # usage are silently excluded.
+    # section reconciles. Every cost center (active or not) is fetched, but
+    # only those with real usage (> 0) this period end up in the report;
+    # ones with no usage this period are excluded.
     print("Fetching cost centers...")
     try:
-        cost_centers = fetch_cost_centers(session, args.enterprise)  # active_only=True by default
-        print(f"  Found {len(cost_centers)} active cost center(s): {[c.get('name') for c in cost_centers]}")
+        # active_only=False: fetch EVERY cost center, not just ones GitHub marks
+        # "active". A cost center's `state` field has been observed to not
+        # always line up with whether it has real usage this period -- filtering
+        # to "active" risks silently skipping a cost center's usage call entirely
+        # (no error, it just never gets queried). There's no downside to fetching
+        # all of them: any cost center with zero usage this period is already
+        # dropped later by build_usage_by_bucket's "total > 0" check, so casting
+        # a wider net here only prevents real usage from going missing.
+        cost_centers = fetch_cost_centers(session, args.enterprise, active_only=False)
+        print(f"  Found {len(cost_centers)} cost center(s) total: {[c.get('name') for c in cost_centers]}")
         cc_api_credits, cc_additional, model_credits, model_additional = \
             build_usage_by_bucket(session, args.enterprise, year, month, cost_centers)
         enterprise_total = sum(cc_api_credits.values())
         enterprise_additional = sum(cc_additional.values())
         if not model_credits:
             print("  WARNING: no usageItems came back for any bucket this month.", file=sys.stderr)
+        missing = audit_cost_center_coverage(detailed_agg["cc_credits"], cc_api_credits)
+        if missing:
+            print(f"  WARNING: {len(missing)} cost center(s) show usage in the detailed report "
+                  f"but are missing from this report's cost-center breakdown -- see above. "
+                  f"Total AI Credits Used and the cost-center rows below are understated.",
+                  file=sys.stderr)
     except Exception as e:
         print(f"  WARNING: couldn't get cost-center/model breakdown ({e}). "
               f"Falling back to detailed report totals (these come from a different "
