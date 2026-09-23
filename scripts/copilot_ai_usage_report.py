@@ -429,7 +429,7 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
     Fetches AI credit usage per cost center via the ai_credit/usage endpoint
     (same source as GitHub's billing UI), PLUS a separate call for usage not
     associated with any cost center. Returns (cc_credits, cc_additional,
-    cc_users, cc_allocated, model_credits, model_additional):
+    cc_users, cc_allocated, cc_pool_used, model_credits, model_additional):
 
       cc_credits / model_credits: {name: total_credits} -- TOTAL AI credits
         consumed (included-pool usage + additional usage combined), i.e.
@@ -453,13 +453,25 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
 
       cc_allocated: {name: allocated_credits} -- the size of the AI credit
         pool allocated to that cost center, taken straight from the cost
-        center object's `ai_credit_pool_state.target_amount` (this is the
-        same figure the billing UI shows as "AI Credit Pool Enabled:
-        used/allocated"). Only populated when the cost center has
-        `ai_credit_pool_enabled` set; otherwise the value is None (the
-        cost center draws from the shared enterprise pool, so it has no
-        allocation of its own). There's no entry for "(Not Assigned)"
-        usage, for the same reason there's no cc_users entry for it.
+        center object's `ai_credit_pool_state.target_amount` (the Y in the
+        billing UI's "AI Credit Pool Enabled: X/Y"). Only populated when
+        the cost center has `ai_credit_pool_enabled` set; otherwise the
+        value is None (the cost center draws from the shared enterprise
+        pool, so it has no allocation of its own). There's no entry for
+        "(Not Assigned)" usage, for the same reason there's no cc_users
+        entry for it.
+
+      cc_pool_used: {name: pool_credits_used} -- how much of that same pool
+        has actually been drawn down, taken from `ai_credit_pool_state.
+        current_amount` (the X in "AI Credit Pool Enabled: X/Y" -- this is
+        the exact number the billing UI's Cost Centers page shows). Only
+        populated when the pool is enabled, same as cc_allocated. This is
+        NOT derived from gross/net below and will not generally equal
+        (total - additional) for that cost center: current_amount tracks
+        consumption against the cost center's OWN pool cap, while gross/net
+        tracks consumption against the ENTERPRISE-WIDE shared included-
+        credit discount -- two independent budgets that happen to both be
+        called "credits."
 
     Cost centers (and models) with zero total credits this period are
     dropped from the result entirely, rather than shown as a 0.00 row --
@@ -556,15 +568,29 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
         cc_id = cc.get("id")
         cc_name = (cc.get("name") or "").strip() or "(Unnamed Cost Center)"
         user_count = len(_resolve_users(cc))
-        # AI credit pool allocation is a static property of the cost center
-        # (not derived from usage), so it's captured here regardless of
-        # whether this cost center ends up having any usage this period.
-        # Only meaningful when the pool is enabled -- otherwise the cost
-        # center draws from the shared enterprise pool and has no
-        # allocation of its own.
+        # AI credit pool allocation/consumption is a static property of the
+        # cost center (not derived from the ai_credit/usage endpoint), so
+        # it's captured here regardless of whether this cost center ends up
+        # having any usage this period. Only meaningful when the pool is
+        # enabled -- otherwise the cost center draws from the shared
+        # enterprise pool and has no allocation/consumption of its own.
+        #
+        # `target_amount` and `current_amount` are exactly the Y and X the
+        # billing UI's Cost Centers page shows as "AI Credit Pool Enabled:
+        # X/Y" for this cost center. This is a DIFFERENT metric from the
+        # gross/net split below: gross/net (from ai_credit/usage) tracks
+        # this cost center's usage against the ENTERPRISE-WIDE shared
+        # included-credit discount, while current_amount tracks it against
+        # this cost center's OWN pool cap. A cost center can be at/over its
+        # own pool cap while still shown as "0 additional" in the gross/net
+        # split (or vice versa) -- they are independent budgets, not two
+        # views of the same number, so don't expect them to reconcile.
         allocated = None
+        pool_used = None
         if cc.get("ai_credit_pool_enabled"):
-            allocated = (cc.get("ai_credit_pool_state") or {}).get("target_amount")
+            pool_state = cc.get("ai_credit_pool_state") or {}
+            allocated = pool_state.get("target_amount")
+            pool_used = pool_state.get("current_amount")
         try:
             items = fetch_ai_credit_usage_by_model(session, enterprise, year, month, cost_center_id=cc_id)
         except Exception as e:
@@ -574,7 +600,8 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
         total, additional = _accumulate(items)
         if total > 0:
             cc_totals_by_id[cc_id] = {"name": cc_name, "total": total, "additional": additional,
-                                       "users": user_count, "allocated": allocated}
+                                       "users": user_count, "allocated": allocated,
+                                       "pool_used": pool_used}
 
     try:
         unassigned_items = fetch_ai_credit_usage_by_model(session, enterprise, year, month, cost_center_id="none")
@@ -585,7 +612,7 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
     total, additional = _accumulate(unassigned_items)
     if total > 0:
         cc_totals_by_id["__unassigned__"] = {"name": "(Not Assigned)", "total": total, "additional": additional,
-                                              "users": None, "allocated": None}
+                                              "users": None, "allocated": None, "pool_used": None}
 
     # Model rows with zero net total this period are dropped, matching the
     # same "only real usage" rule applied to cost centers above.
@@ -600,7 +627,7 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
     for info in cc_totals_by_id.values():
         name_counts[info["name"]] = name_counts.get(info["name"], 0) + 1
 
-    cc_credits, cc_additional, cc_users, cc_allocated = {}, {}, {}, {}
+    cc_credits, cc_additional, cc_users, cc_allocated, cc_pool_used = {}, {}, {}, {}, {}
     for cc_id, info in cc_totals_by_id.items():
         name = info["name"]
         if name_counts[name] > 1:
@@ -614,6 +641,7 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
         cc_additional[display_name] = info["additional"]
         cc_users[display_name] = info["users"]
         cc_allocated[display_name] = info["allocated"]
+        cc_pool_used[display_name] = info["pool_used"]
 
     # Sanity check: since cc_credits/cc_additional and model_credits/model_additional
     # are built from the exact same set of API responses, their totals must match.
@@ -636,7 +664,7 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
               file=sys.stderr)
 
     print(f"  Cost centers checked: {len(cost_centers)}. Rows with usage in report: {len(cc_credits)}.")
-    return cc_credits, cc_additional, cc_users, cc_allocated, model_credits, model_additional
+    return cc_credits, cc_additional, cc_users, cc_allocated, cc_pool_used, model_credits, model_additional
 
 
 # ---------------------------------------------------------------------------
@@ -644,7 +672,7 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
 # ---------------------------------------------------------------------------
 
 def write_report(output_path, detailed_agg, model_credits, model_additional, cc_api_credits, cc_additional,
-                 cc_users, cc_allocated, enterprise_total, enterprise_additional,
+                 cc_users, cc_allocated, cc_pool_used, enterprise_total, enterprise_additional,
                  year, month):
 
     with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -671,20 +699,45 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
         # (i.e. `ai_credit_pool_enabled`) -- cost centers without one don't
         # contribute a number here, so this is not simply "all rows summed".
         cc_allocated_sum = sum(v for v in cc_allocated.values() if v is not None)
+        # Sum of the same "Used AI Credits" figure as printed per row above
+        # (pool current_amount where the cost center has its own pool, else
+        # the total-minus-additional fallback) -- so this TOTAL is a real
+        # sum of the column above it, not a re-derivation from a different
+        # source. It will generally NOT equal "Total Included AI Credits
+        # Used" in OVERALL METRICS above, since that figure comes from the
+        # enterprise-wide gross/net split, a different budget than any
+        # individual cost center's own pool -- see cc_pool_used docstring.
+        used_fallback_flagged = False
+        cc_used_sum = 0.0
+        for cc_name in cc_api_credits:
+            pu = cc_pool_used.get(cc_name)
+            if pu is not None:
+                cc_used_sum += pu
+            else:
+                cc_used_sum += cc_api_credits[cc_name] - cc_additional.get(cc_name, 0.0)
+                used_fallback_flagged = True
         for cc_name in sorted(cc_api_credits, key=lambda k: -cc_api_credits[k]):
             credits_ = cc_api_credits[cc_name]
             additional_ = cc_additional.get(cc_name, 0.0)
-            # "Used AI Credits" reflects only what this cost center consumed from
-            # its own allocated/included pool -- additional (overage) usage is
-            # reported separately in its own column, the same split already used
-            # in the MODEL WISE section below, so the two don't double-count.
-            included_ = credits_ - additional_
+            pool_used_ = cc_pool_used.get(cc_name)
+            # "Used AI Credits" is this cost center's own AI Credit Pool
+            # consumption (ai_credit_pool_state.current_amount) -- the exact
+            # X the billing UI's Cost Centers page shows as "X/Y" next to
+            # "AI Credits Allocated" (the Y). When the cost center has no
+            # pool of its own (draws from the shared enterprise pool
+            # instead), there's nothing to show it against, so it falls
+            # back to (total - additional) as the best available estimate
+            # of its own consumption, flagged with an asterisk.
+            if pool_used_ is not None:
+                used_display = f"{pool_used_:,.2f}"
+            else:
+                used_display = f"{credits_ - additional_:,.2f}*"
             pct = (credits_ / enterprise_total * 100) if enterprise_total else 0
             user_count = cc_users.get(cc_name)
             user_display = user_count if user_count is not None else "(n/a)"
             allocated_ = cc_allocated.get(cc_name)
             allocated_display = f"{allocated_:,.2f}" if allocated_ is not None else "(n/a)"
-            writer.writerow([cc_name, allocated_display, f"{included_:,.2f}",
+            writer.writerow([cc_name, allocated_display, used_display,
                               f"{additional_:,.2f}", user_display, f"{pct:.2f}%"])
         # This TOTAL row's Users cell is a straight SUM of the rows above (like
         # every other column in this row) -- the same cc_users_sum reported as
@@ -694,8 +747,12 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
         # is counted once per cost center they belong to.
         writer.writerow(["TOTAL",
                           f"{cc_allocated_sum:,.2f}" if any(v is not None for v in cc_allocated.values())
-                          else "(n/a)", f"{enterprise_total - enterprise_additional:,.2f}",
+                          else "(n/a)", f"{cc_used_sum:,.2f}",
                           f"{enterprise_additional:,.2f}", cc_users_sum, "100.00%"])
+        if used_fallback_flagged:
+            writer.writerow(["* cost center has no AI Credit Pool of its own; \"Used AI Credits\" "
+                              "shown is (Used AI Credits from ai_credit/usage - Additional AI Credits), "
+                              "not a pool figure."])
         writer.writerow([])
 
         writer.writerow(["MODEL WISE AI CREDIT USAGE"])
@@ -829,7 +886,7 @@ def main():
         # a wider net here only prevents real usage from going missing.
         cost_centers = fetch_cost_centers(session, args.enterprise, active_only=False)
         print(f"  Found {len(cost_centers)} cost center(s) total: {[c.get('name') for c in cost_centers]}")
-        cc_api_credits, cc_additional, cc_users, cc_allocated, model_credits, model_additional = \
+        cc_api_credits, cc_additional, cc_users, cc_allocated, cc_pool_used, model_credits, model_additional = \
             build_usage_by_bucket(session, args.enterprise, year, month, cost_centers)
         enterprise_total = sum(cc_api_credits.values())
         enterprise_additional = sum(cc_additional.values())
@@ -851,6 +908,7 @@ def main():
         cc_additional = {}
         cc_users = {}
         cc_allocated = {}
+        cc_pool_used = {}
         model_credits = {"(Model Breakdown Unavailable)": detailed_agg["total_credits"]}
         model_additional = {}
         enterprise_total = detailed_agg["total_credits"]
@@ -861,7 +919,7 @@ def main():
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
     write_report(output_path, detailed_agg, model_credits, model_additional, cc_api_credits, cc_additional,
-                 cc_users, cc_allocated, enterprise_total, enterprise_additional,
+                 cc_users, cc_allocated, cc_pool_used, enterprise_total, enterprise_additional,
                  year, month)
 
     print(f"\nDone. Report written to {output_path}")
