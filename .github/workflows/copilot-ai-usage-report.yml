@@ -1,13 +1,18 @@
 # Place this file at: .github/workflows/copilot-ai-usage-report.yml
-# in a repo the enterprise billing-manager/owner token can push to.
 #
 # Runs at 03:00 UTC (08:30 AM IST) on the 1st of every month, generates the
-# detailed usage report for the month that just ended, and commits + uploads
-# the CSV, then sends it via email.
+# detailed usage report for the month that just ended, uploads it as a
+# workflow artifact, and emails it. Generated files are kept outside the
+# repository workspace and are never committed or pushed.
+#
+# Manual runs (workflow_dispatch): leave "report_month" blank to get last
+# month's report (same default the scheduled run uses), or type a specific
+# month as YYYY-MM to pull that month instead.
 #
 # Required secrets:
 #   COPILOT_TOKEN    — PAT with manage_billing:enterprise (or fine-grained
-#                      "Enterprise administration" write permission)
+#                      "Enterprise administration" read permission) — used
+#                      only to call the billing API, not for git operations
 #   ENTERPRISE_SLUG  — GitHub enterprise slug
 #   SMTP_SERVER      — SMTP hostname (e.g. smtp.gmail.com)
 #   SMTP_PORT        — SMTP port (e.g. 587 for STARTTLS)
@@ -24,26 +29,23 @@ on:
     inputs:
       report_month:
         description: >
-          Select which month's report to generate (YYYY-MM).
-          Choose the month whose data you want to pull.
-        required: true
-        default: '2026-07'
-        type: choice
-        options:
-          - '2026-06'
-          - '2026-07'
+          Month to generate the report for, as YYYY-MM (e.g. 2026-07).
+          Leave blank to default to last month.
+        required: false
+        default: ''
+        type: string
 
 jobs:
   generate-report:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    env:
+      REPORT_DIR: $RUNNER_TEMP/copilot-ai-usage
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -53,11 +55,20 @@ jobs:
       - name: Compute report month
         id: month
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            REPORT_DATE="${{ inputs.report_month }}-01"
+          INPUT_MONTH="${{ inputs.report_month }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$INPUT_MONTH" ]; then
+            # A specific month was typed in — validate it's YYYY-MM.
+            if ! [[ "$INPUT_MONTH" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]; then
+              echo "ERROR: report_month must be in YYYY-MM format (e.g. 2026-07), got: '$INPUT_MONTH'" >&2
+              exit 1
+            fi
+            REPORT_DATE="${INPUT_MONTH}-01"
           else
+            # No month typed (or this is the scheduled run) — default to last month.
             REPORT_DATE=$(date -d "$(date +%Y-%m-01) -1 day" +%Y-%m-01)
           fi
+
           YEAR=$(date -d "$REPORT_DATE" +%Y)
           MONTH=$(date -d "$REPORT_DATE" +%-m)
           LABEL=$(date -d "$REPORT_DATE" +%Y-%m)
@@ -70,25 +81,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.COPILOT_TOKEN }}   # PAT with manage_billing:enterprise (or fine-grained "Enterprise administration" write)
           GITHUB_ENTERPRISE: ${{ secrets.ENTERPRISE_SLUG }}
         run: |
-          mkdir -p reports
+          mkdir -p "$REPORT_DIR"
           python scripts/copilot_ai_usage_report.py \
             --year ${{ steps.month.outputs.year }} \
             --month ${{ steps.month.outputs.month }} \
-            --output reports/copilot_ai_usage_${{ steps.month.outputs.label }}.csv
+            --output "$REPORT_DIR/copilot_ai_usage_${{ steps.month.outputs.label }}.csv"
 
       - name: Upload as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: copilot-ai-usage-report
-          path: reports/*.csv
-
-      - name: Commit report to repo
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add reports/*.csv
-          git commit -m "Add Copilot AI usage report for ${{ steps.month.outputs.label }}" || echo "Nothing to commit"
-          git push
+          path: ${{ runner.temp }}/copilot-ai-usage/*.csv
 
       - name: Send report via email
         env:
@@ -121,7 +124,7 @@ jobs:
           body = f"Please find attached the Copilot AI Usage Report for {label}."
           msg.attach(MIMEText(body, "plain"))
 
-          csv_file = f"reports/copilot_ai_usage_{label}.csv"
+          csv_file = os.path.join(os.environ["REPORT_DIR"], f"copilot_ai_usage_{label}.csv")
           if os.path.exists(csv_file):
               with open(csv_file, "rb") as f:
                   part = MIMEBase("application", "octet-stream")
