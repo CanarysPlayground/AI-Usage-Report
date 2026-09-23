@@ -5,12 +5,11 @@ GitHub Copilot AI Usage — Monthly Report Generator (v5)
 Produces a CSV with three sections:
 
   OVERALL METRICS
-    Total Allocated Credits, Total AI Credits Used, Total Copilot
-    Licensed Users, Total Unique Users
+    Total AI Credits Used, Total licensed users
 
   COST CENTER WISE AI CREDIT USAGE
-    Cost Center, Total AI Credits, Additional AI Credits, Unique Users,
-    % of Total Credits
+    Cost Center, AI Credits Allocated, Used AI Credits, Additional AI Credits,
+    Users in Cost Center, % of Total Credits
 
   MODEL WISE AI CREDIT USAGE
     Model Name, Total AI Credits, Additional AI Credits, % of Total Credits
@@ -42,31 +41,32 @@ undocumented behavior, and guarantees the COST CENTER WISE total, the
 MODEL WISE total, and "Total AI Credits Used" always reconcile exactly,
 by construction.
 
-Unique-users counts per cost center still come from the `detailed` report
-export, which carries per-row user information:
+The `detailed` report export is still fetched for total credits/transaction
+figures used elsewhere in the script:
 
   POST /enterprises/{enterprise}/settings/billing/reports
        {"report_type": "detailed", "start_date": ..., "end_date": ...}
   GET  /enterprises/{enterprise}/settings/billing/reports/{id}   (poll)
   -> download_urls once status == "completed"
 
-Cost centers are listed via:
+Cost centers -- and the users actually assigned to each one -- are listed
+via the same call:
 
   GET /enterprises/{enterprise}/settings/billing/cost-centers?state=active
 
-ALLOCATED CREDITS
-------------------
-GitHub doesn't expose the enterprise-wide included-credit pool under a
-documented API field, so this is calculated from licensed seats per
-"Usage-based billing for organizations and enterprises":
-  https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-organizations-and-enterprises
+This endpoint's response includes each cost center's `resources` array
+(entries with `type: "User"`, `"Org"`, `"Repo"`, or `"Team"` for an
+attached enterprise team), which is the exact, authoritative membership
+list for that cost center -- independent of whether a member had any
+usage this period. "Users in Cost Center" in the COST CENTER WISE section
+counts every `type == "User"` resource plus every member of any attached
+`type == "Team"` resource (fetched via the enterprise team memberships
+endpoint and deduplicated). "Total licensed users" in OVERALL METRICS is
+the sum of that column across all cost centers.
 
-Standard included credits per seat/month: Business = 1,900, Enterprise =
-3,900. BUT existing customers get a PROMOTIONAL amount for their first
-three billing cycles under usage-based billing — June, July, and August
-2026 (Business = 3,000, Enterprise = 7,000) — reverting to standard from
-the September 2026 cycle onward. The script picks the right table based
-on which month is being reported on, not the date the script is run.
+Expanding a Team resource requires the token to also carry the
+read:enterprise scope, in addition to manage_billing:enterprise -- see
+LICENSED USERS below.
 
 LICENSED USERS
 ---------------
@@ -84,6 +84,12 @@ tokens and fine-grained PATs (per GitHub's REST API docs), so the
 cost-center listing and the detailed export -- and therefore the COST
 CENTER WISE and MODEL WISE sections -- would fail even though the
 AI-credit-usage and seats calls might succeed with such a token.
+
+If any cost center has an enterprise team attached as a resource, the PAT
+also needs the read:enterprise scope, which the enterprise team memberships
+endpoint requires separately from manage_billing:enterprise. Without it,
+that team's members can't be listed -- the script warns and undercounts
+"Users in Cost Center" for that cost center rather than failing outright.
 
 Usage:
     export GITHUB_TOKEN=ghp_xxx
@@ -186,7 +192,7 @@ def create_usage_report(session, enterprise, start_date, end_date, report_type):
     return resp.json()
 
 
-def poll_usage_report(session, enterprise, report_id, timeout_seconds=600, interval_seconds=10):
+def poll_usage_report(session, enterprise, report_id, timeout_seconds=1800, interval_seconds=10):
     url = f"{base_url()}/enterprises/{enterprise}/settings/billing/reports/{report_id}"
     waited = 0
     while waited <= timeout_seconds:
@@ -229,91 +235,6 @@ def fetch_report_csv(session, enterprise, report_type, start_date, end_date, sav
         print(f"Raw {report_type} CSV saved to {save_raw_path}")
     return csv_text
 
-
-# ---------------------------------------------------------------------------
-# Step 2: fetch licensed seats (full list, so we get each seat's plan_type),
-# de-duplicated by assignee since the same person can appear via more than
-# one organization within the enterprise but is billed/counted only once.
-# ---------------------------------------------------------------------------
-
-def fetch_all_seats(session, enterprise):
-    seats = []
-    url = f"{base_url()}/enterprises/{enterprise}/copilot/billing/seats"
-    page = 1
-    while True:
-        resp = session.get(url, params={"per_page": 100, "page": page})
-        resp.raise_for_status()
-        data = resp.json()
-        batch = data.get("seats", [])
-        seats.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    return seats
-
-
-def dedupe_seats_by_user(seats):
-    """Keep one seat per unique assignee login (case-insensitive)."""
-    seen = {}
-    for seat in seats:
-        assignee = seat.get("assignee") or {}
-        login = (assignee.get("login") or "").strip().lower()
-        key = login or f"__no_login_{id(seat)}"
-        if key not in seen:
-            seen[key] = seat
-    return list(seen.values())
-
-
-# ---------------------------------------------------------------------------
-# Step 3: allocated / included AI credits, calculated from licensed seats
-# ---------------------------------------------------------------------------
-
-# Standard included credits per seat/month (docs.github.com/.../usage-based-billing...)
-STANDARD_INCLUDED_CREDITS = {
-    "business": 1900,
-    "enterprise": 3900,
-}
-
-# Promotional amounts for EXISTING customers' first three billing cycles
-# under usage-based billing: June 1 - September 1, 2026.
-PROMO_INCLUDED_CREDITS = {
-    "business": 3000,
-    "enterprise": 7000,
-}
-PROMO_WINDOW_START = datetime.date(2026, 6, 1)   # inclusive
-PROMO_WINDOW_END = datetime.date(2026, 9, 1)     # exclusive -> Sept cycle is standard
-
-
-def normalize_plan_type(plan_type):
-    return (plan_type or "").strip().lower().replace("+", "_plus").replace("-", "_")
-
-
-def included_credits_table_for(year, month):
-    cycle_start = datetime.date(year, month, 1)
-    if PROMO_WINDOW_START <= cycle_start < PROMO_WINDOW_END:
-        return PROMO_INCLUDED_CREDITS
-    return STANDARD_INCLUDED_CREDITS
-
-
-def compute_allocated_credits_from_seats(seats, year, month):
-    """
-    Sums each *unique* licensed seat's included AI credit allotment based
-    on its plan_type and which billing cycle is being reported on.
-    Returns (total_allocated_credits, total_unique_licensed_users,
-    unrecognized_plan_types_seen).
-    """
-    unique_seats = dedupe_seats_by_user(seats)
-    table = included_credits_table_for(year, month)
-
-    total = 0
-    unrecognized = set()
-    for seat in unique_seats:
-        plan = normalize_plan_type(seat.get("plan_type"))
-        if plan in table:
-            total += table[plan]
-        elif plan:
-            unrecognized.add(plan)
-    return total, len(unique_seats), unrecognized
 
 
 # ---------------------------------------------------------------------------
@@ -390,29 +311,19 @@ def aggregate_detailed(csv_text):
               f"look right if this report looks off.)", file=sys.stderr)
 
     total_credits = 0.0
-    all_users = set()
     cc_credits = {}
-    cc_users = {}
 
     for r in rows:
         qty = float(r.get(cols["quantity"]) or 0)
         cc_name = (r.get(cols.get("cost_center_name", ""), "") or "").strip() or "(Not Assigned)"
-        username = (r.get(cols.get("username", ""), "") or "").strip().lower()
 
         total_credits += qty
-        if username:
-            all_users.add(username)
-
         cc_credits[cc_name] = cc_credits.get(cc_name, 0.0) + qty
-        if username:
-            cc_users.setdefault(cc_name, set()).add(username)
 
     return {
         "total_credits": total_credits,
-        "total_unique_users": len(all_users),
         "total_transactions": len(rows),
         "cc_credits": {k: v for k, v in cc_credits.items() if v > 0.0},
-        "cc_users": {k: len(v) for k, v in cc_users.items()},
         "headers": reader.fieldnames,
     }
 
@@ -479,12 +390,46 @@ def fetch_cost_centers(session, enterprise, active_only=True):
     return active
 
 
+def fetch_enterprise_team_members(session, enterprise, team_slug):
+    """
+    Lists the members of an enterprise team:
+
+      GET /enterprises/{enterprise}/teams/{team_slug}/memberships
+
+    Cost centers can have enterprise teams attached as a resource (in
+    addition to individual users) -- every member of an attached team is
+    billed through that cost center, and membership is kept in sync
+    automatically as people join or leave the team. Counting a Team
+    resource as "1 user" would badly undercount who's actually being
+    billed through it, so this expands it into the real member list.
+
+    Requires the classic PAT to also carry the read:enterprise scope --
+    manage_billing:enterprise alone (see module docstring) does not cover
+    this endpoint. A 403 here is reported by the caller as a warning
+    naming that requirement, rather than aborting the whole report.
+    """
+    url = f"{base_url()}/enterprises/{enterprise}/teams/{team_slug}/memberships"
+    members = []
+    page = 1
+    while True:
+        resp = session.get(url, params={"per_page": 100, "page": page})
+        resp.raise_for_status()
+        batch = resp.json()
+        if not isinstance(batch, list):
+            batch = batch.get("members", []) if isinstance(batch, dict) else []
+        members.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return members
+
+
 def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
     """
     Fetches AI credit usage per cost center via the ai_credit/usage endpoint
     (same source as GitHub's billing UI), PLUS a separate call for usage not
     associated with any cost center. Returns (cc_credits, cc_additional,
-    model_credits, model_additional):
+    cc_users, cc_allocated, model_credits, model_additional):
 
       cc_credits / model_credits: {name: total_credits} -- TOTAL AI credits
         consumed (included-pool usage + additional usage combined), i.e.
@@ -495,6 +440,26 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
         `netQuantity` (matches the billing UI's "Additional credits"
         column; 0 for a cost center/model that stayed within its included
         allotment).
+
+      cc_users: {name: user_count} -- the exact number of distinct users
+        "in" that cost center: every `type == "User"` entry in its
+        `resources` array, PLUS every member of any `type == "Team"`
+        (enterprise team) entry, expanded via fetch_enterprise_team_members
+        and deduplicated. This is the cost center's actual membership, not
+        derived from usage, so it's unaffected by whether a
+        member happened to use Copilot this period. There's no entry for
+        "(Not Assigned)" usage, since unassigned usage isn't tied to any
+        cost center's resource list.
+
+      cc_allocated: {name: allocated_credits} -- the size of the AI credit
+        pool allocated to that cost center, taken straight from the cost
+        center object's `ai_credit_pool_state.target_amount` (this is the
+        same figure the billing UI shows as "AI Credit Pool Enabled:
+        used/allocated"). Only populated when the cost center has
+        `ai_credit_pool_enabled` set; otherwise the value is None (the
+        cost center draws from the shared enterprise pool, so it has no
+        allocation of its own). There's no entry for "(Not Assigned)"
+        usage, for the same reason there's no cc_users entry for it.
 
     Cost centers (and models) with zero total credits this period are
     dropped from the result entirely, rather than shown as a 0.00 row --
@@ -547,9 +512,59 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
             model_additional[model] = model_additional.get(model, 0.0) + net
         return total, additional
 
+    # Cache of enterprise team slug -> set of member logins (or None if that
+    # team's member lookup failed), so a team attached to more than one
+    # cost center -- or referenced again for some other reason -- is only
+    # fetched once.
+    team_member_cache = {}
+
+    def _resolve_users(cc):
+        """
+        Distinct user logins "in" this cost center: every `type == "User"`
+        resource, plus every member of any `type == "Team"` (enterprise
+        team) resource, expanded and deduplicated. A team whose member
+        lookup fails is skipped with a warning -- the resulting count is
+        then a known undercount for this cost center rather than a silent
+        one.
+        """
+        cc_name = (cc.get("name") or "").strip() or "(Unnamed Cost Center)"
+        users = set()
+        for resource in cc.get("resources") or []:
+            rtype = resource.get("type") or ""
+            name = resource.get("name")
+            if not name:
+                continue
+            if rtype == "User":
+                users.add(name)
+            elif rtype == "Team":
+                if name not in team_member_cache:
+                    try:
+                        members = fetch_enterprise_team_members(session, enterprise, name)
+                        team_member_cache[name] = {m.get("login") for m in members if m.get("login")}
+                    except Exception as e:
+                        print(f"  WARNING: couldn't fetch members of enterprise team '{name}' "
+                              f"(cost center '{cc_name}'): {e}. This cost center's user count "
+                              f"will be undercounted -- confirm the token also has the "
+                              f"read:enterprise scope.", file=sys.stderr)
+                        team_member_cache[name] = None
+                members_set = team_member_cache[name]
+                if members_set:
+                    users.update(members_set)
+        return users
+
     for cc in cost_centers:
         cc_id = cc.get("id")
         cc_name = (cc.get("name") or "").strip() or "(Unnamed Cost Center)"
+        user_count = len(_resolve_users(cc))
+        # AI credit pool allocation is a static property of the cost center
+        # (not derived from usage), so it's captured here regardless of
+        # whether this cost center ends up having any usage this period.
+        # Only meaningful when the pool is enabled -- otherwise the cost
+        # center draws from the shared enterprise pool and has no
+        # allocation of its own.
+        allocated = None
+        if cc.get("ai_credit_pool_enabled"):
+            allocated = (cc.get("ai_credit_pool_state") or {}).get("target_amount")
         try:
             items = fetch_ai_credit_usage_by_model(session, enterprise, year, month, cost_center_id=cc_id)
         except Exception as e:
@@ -558,7 +573,8 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
             continue
         total, additional = _accumulate(items)
         if total > 0:
-            cc_totals_by_id[cc_id] = {"name": cc_name, "total": total, "additional": additional}
+            cc_totals_by_id[cc_id] = {"name": cc_name, "total": total, "additional": additional,
+                                       "users": user_count, "allocated": allocated}
 
     try:
         unassigned_items = fetch_ai_credit_usage_by_model(session, enterprise, year, month, cost_center_id="none")
@@ -568,7 +584,8 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
         unassigned_items = []
     total, additional = _accumulate(unassigned_items)
     if total > 0:
-        cc_totals_by_id["__unassigned__"] = {"name": "(Not Assigned)", "total": total, "additional": additional}
+        cc_totals_by_id["__unassigned__"] = {"name": "(Not Assigned)", "total": total, "additional": additional,
+                                              "users": None, "allocated": None}
 
     # Model rows with zero net total this period are dropped, matching the
     # same "only real usage" rule applied to cost centers above.
@@ -583,7 +600,7 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
     for info in cc_totals_by_id.values():
         name_counts[info["name"]] = name_counts.get(info["name"], 0) + 1
 
-    cc_credits, cc_additional = {}, {}
+    cc_credits, cc_additional, cc_users, cc_allocated = {}, {}, {}, {}
     for cc_id, info in cc_totals_by_id.items():
         name = info["name"]
         if name_counts[name] > 1:
@@ -595,6 +612,8 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
             display_name = name
         cc_credits[display_name] = info["total"]
         cc_additional[display_name] = info["additional"]
+        cc_users[display_name] = info["users"]
+        cc_allocated[display_name] = info["allocated"]
 
     # Sanity check: since cc_credits/cc_additional and model_credits/model_additional
     # are built from the exact same set of API responses, their totals must match.
@@ -617,67 +636,16 @@ def build_usage_by_bucket(session, enterprise, year, month, cost_centers):
               file=sys.stderr)
 
     print(f"  Cost centers checked: {len(cost_centers)}. Rows with usage in report: {len(cc_credits)}.")
-    return cc_credits, cc_additional, model_credits, model_additional
+    return cc_credits, cc_additional, cc_users, cc_allocated, model_credits, model_additional
 
 
 # ---------------------------------------------------------------------------
 # Step 5: write the four-section CSV
 # ---------------------------------------------------------------------------
 
-def match_cost_center_users(cc_names, cc_users):
-    """
-    cc_names come from the ai_credit/usage cost-center list (the
-    authoritative source for credit totals); cc_users is keyed by whatever
-    cost_center_name string showed up in the separate `detailed` CSV
-    export. These are two independent API calls, so a cost center that's
-    real and has credit usage can still fail to line up on an exact string
-    match (case, extra whitespace beyond a plain .strip(), a rename between
-    calls, etc.) -- and silently showing "0" for Unique Users in that case
-    looks like valid data instead of a join miss.
-
-    Matches first by exact name, then falls back to a case/space-normalized
-    match. Any cc_name that still can't be matched to a detailed-report
-    cost center is reported via a warning rather than silently defaulted to
-    0, and the caller decides what to show.
-
-    Returns {cc_name: user_count_or_None}. None means "no match found" --
-    the caller is responsible for rendering that distinctly from a real 0.
-    """
-    def _norm(s):
-        return " ".join((s or "").strip().lower().split())
-
-    normalized_index = {}
-    for name, count in cc_users.items():
-        normalized_index.setdefault(_norm(name), []).append((name, count))
-
-    resolved = {}
-    for cc_name in cc_names:
-        if cc_name in cc_users:
-            resolved[cc_name] = cc_users[cc_name]
-            continue
-        candidates = normalized_index.get(_norm(cc_name), [])
-        if len(candidates) == 1:
-            matched_name, count = candidates[0]
-            print(f"  NOTE: matched cost center '{cc_name}' (credit usage) to "
-                  f"'{matched_name}' (detailed report) by normalized name -- exact "
-                  f"strings differed.", file=sys.stderr)
-            resolved[cc_name] = count
-        elif len(candidates) > 1:
-            print(f"  WARNING: cost center '{cc_name}' has {len(candidates)} ambiguous "
-                  f"normalized-name matches in the detailed report {[c[0] for c in candidates]}. "
-                  f"Unique Users left blank for this row -- investigate separately.", file=sys.stderr)
-            resolved[cc_name] = None
-        else:
-            print(f"  WARNING: cost center '{cc_name}' has AI credit usage but no matching "
-                  f"entry in the detailed report -- Unique Users can't be determined for it "
-                  f"(shown as blank, not 0).", file=sys.stderr)
-            resolved[cc_name] = None
-    return resolved
-
-
 def write_report(output_path, detailed_agg, model_credits, model_additional, cc_api_credits, cc_additional,
-                 enterprise_total, enterprise_additional, total_licensed_users, total_allocated_credits,
-                 year, month, unrecognized_plans=None):
+                 cc_users, cc_allocated, enterprise_total, enterprise_additional,
+                 year, month):
 
     with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
@@ -686,33 +654,48 @@ def write_report(output_path, detailed_agg, model_credits, model_additional, cc_
         writer.writerow([])
 
         writer.writerow(["OVERALL METRICS"])
-        writer.writerow(["Total Allocated Credits", f"{total_allocated_credits:,.2f}"])
+        # Computed once up front so OVERALL METRICS and the COST CENTER WISE
+        # TOTAL row below report the exact same figure, by construction.
+        cc_users_sum = sum(v for v in cc_users.values() if v is not None)
+
         writer.writerow(["Total Included AI Credits Used", f"{enterprise_total - enterprise_additional:,.2f}"])
         writer.writerow(["Total Additional AI Credits Used", f"{enterprise_additional:,.2f}"])
         writer.writerow(["Total AI Credits Used (included + additional)", f"{enterprise_total:,.2f}"])
-        writer.writerow(["Total Copilot Licensed Users", total_licensed_users])
-        writer.writerow(["Total Unique Users", detailed_agg["total_unique_users"]])
-        if unrecognized_plans:
-            writer.writerow([
-                "  Note", f"seats with unrecognized plan_type excluded from allocation: {sorted(unrecognized_plans)}"
-            ])
+        writer.writerow(["Total licensed users", cc_users_sum])
         writer.writerow([])
 
         writer.writerow(["COST CENTER WISE AI CREDIT USAGE"])
-        writer.writerow(["Cost Center", "Included AI Credits", "Additional AI Credits",
-                          "Unique Users", "% of Total Credits"])
-        cc_user_counts = match_cost_center_users(cc_api_credits.keys(), detailed_agg["cc_users"])
+        writer.writerow(["Cost Center", "AI Credits Allocated", "Used AI Credits",
+                          "Additional AI Credits", "Users in Cost Center", "% of Total Credits"])
+        # Sum of only the cost centers with an actual AI credit pool allocation
+        # (i.e. `ai_credit_pool_enabled`) -- cost centers without one don't
+        # contribute a number here, so this is not simply "all rows summed".
+        cc_allocated_sum = sum(v for v in cc_allocated.values() if v is not None)
         for cc_name in sorted(cc_api_credits, key=lambda k: -cc_api_credits[k]):
             credits_ = cc_api_credits[cc_name]
             additional_ = cc_additional.get(cc_name, 0.0)
+            # "Used AI Credits" reflects only what this cost center consumed from
+            # its own allocated/included pool -- additional (overage) usage is
+            # reported separately in its own column, the same split already used
+            # in the MODEL WISE section below, so the two don't double-count.
             included_ = credits_ - additional_
             pct = (credits_ / enterprise_total * 100) if enterprise_total else 0
-            user_count = cc_user_counts.get(cc_name)
-            user_display = user_count if user_count is not None else "(unmatched)"
-            writer.writerow([cc_name, f"{included_:,.2f}", f"{additional_:,.2f}",
-                              user_display, f"{pct:.2f}%"])
-        writer.writerow(["TOTAL", f"{enterprise_total - enterprise_additional:,.2f}",
-                          f"{enterprise_additional:,.2f}", detailed_agg["total_unique_users"], "100.00%"])
+            user_count = cc_users.get(cc_name)
+            user_display = user_count if user_count is not None else "(n/a)"
+            allocated_ = cc_allocated.get(cc_name)
+            allocated_display = f"{allocated_:,.2f}" if allocated_ is not None else "(n/a)"
+            writer.writerow([cc_name, allocated_display, f"{included_:,.2f}",
+                              f"{additional_:,.2f}", user_display, f"{pct:.2f}%"])
+        # This TOTAL row's Users cell is a straight SUM of the rows above (like
+        # every other column in this row) -- the same cc_users_sum reported as
+        # "Total licensed users" in OVERALL METRICS above. It is not
+        # deduplicated across cost centers, so a user belonging to more than
+        # one cost center (directly, or via two different enterprise teams)
+        # is counted once per cost center they belong to.
+        writer.writerow(["TOTAL",
+                          f"{cc_allocated_sum:,.2f}" if any(v is not None for v in cc_allocated.values())
+                          else "(n/a)", f"{enterprise_total - enterprise_additional:,.2f}",
+                          f"{enterprise_additional:,.2f}", cc_users_sum, "100.00%"])
         writer.writerow([])
 
         writer.writerow(["MODEL WISE AI CREDIT USAGE"])
@@ -807,9 +790,27 @@ def main():
     else:
         detailed_raw_path = None
 
-    # Detailed report: used for unique-user counts per cost center
-    detailed_csv = fetch_report_csv(session, args.enterprise, "detailed", start_date, end_date, detailed_raw_path)
-    detailed_agg = aggregate_detailed(detailed_csv)
+    # The detailed export is used for auditing and fallback totals. GitHub can
+    # take longer than the polling window to prepare it on the first of the
+    # month, so a slow export must not prevent the billing API report from
+    # being generated.
+    try:
+        detailed_csv = fetch_report_csv(
+            session, args.enterprise, "detailed", start_date, end_date, detailed_raw_path
+        )
+        detailed_agg = aggregate_detailed(detailed_csv)
+    except Exception as e:
+        print(
+            f"  WARNING: detailed report export failed ({e}). "
+            "Continuing with the AI-credit usage API breakdown.",
+            file=sys.stderr,
+        )
+        detailed_agg = {
+            "total_credits": 0.0,
+            "total_transactions": 0,
+            "cc_credits": {},
+            "headers": [],
+        }
 
     # Per-cost-center AND model credits (total + additional/overage) from
     # ai_credit/usage, built together from the same set of calls so every
@@ -828,7 +829,7 @@ def main():
         # a wider net here only prevents real usage from going missing.
         cost_centers = fetch_cost_centers(session, args.enterprise, active_only=False)
         print(f"  Found {len(cost_centers)} cost center(s) total: {[c.get('name') for c in cost_centers]}")
-        cc_api_credits, cc_additional, model_credits, model_additional = \
+        cc_api_credits, cc_additional, cc_users, cc_allocated, model_credits, model_additional = \
             build_usage_by_bucket(session, args.enterprise, year, month, cost_centers)
         enterprise_total = sum(cc_api_credits.values())
         enterprise_additional = sum(cc_additional.values())
@@ -848,31 +849,25 @@ def main():
         # detailed_agg["cc_credits"] already has 0-credit entries filtered out
         cc_api_credits = detailed_agg["cc_credits"]
         cc_additional = {}
+        cc_users = {}
+        cc_allocated = {}
         model_credits = {"(Model Breakdown Unavailable)": detailed_agg["total_credits"]}
         model_additional = {}
         enterprise_total = detailed_agg["total_credits"]
         enterprise_additional = 0.0
 
-    print("Fetching licensed seats...")
-    seats = fetch_all_seats(session, args.enterprise)
-    total_allocated_credits, total_licensed_users, unrecognized_plans = \
-        compute_allocated_credits_from_seats(seats, year, month)
-    if unrecognized_plans:
-        print(f"  WARNING: unrecognized plan_type(s) on some seats, excluded from allocation total: "
-              f"{sorted(unrecognized_plans)}. Add them to STANDARD_INCLUDED_CREDITS / "
-              f"PROMO_INCLUDED_CREDITS if they're valid Copilot plans.", file=sys.stderr)
-
     output_path = args.output or f"copilot_ai_usage_{year}-{month:02d}.csv"
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     write_report(output_path, detailed_agg, model_credits, model_additional, cc_api_credits, cc_additional,
-                 enterprise_total, enterprise_additional, total_licensed_users, total_allocated_credits,
-                 year, month, unrecognized_plans=unrecognized_plans)
+                 cc_users, cc_allocated, enterprise_total, enterprise_additional,
+                 year, month)
 
     print(f"\nDone. Report written to {output_path}")
-    print(f"  Total Allocated Credits: {total_allocated_credits:,.2f}")
     print(f"  Total AI Credits Used: {enterprise_total:,.2f}")
     print(f"  Total Additional AI Credits: {enterprise_additional:,.2f}")
-    print(f"  Total Copilot Licensed Users: {total_licensed_users}")
-    print(f"  Total Unique Users: {detailed_agg['total_unique_users']}")
+
 
 
 if __name__ == "__main__":
